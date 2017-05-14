@@ -9,10 +9,12 @@
     <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>TestExtensions</RootNamespace>
     <AssemblyName>TestExtensions</AssemblyName>
-    <TargetFrameworkVersion>v4.5.1</TargetFrameworkVersion>
+    <TargetFrameworkVersion>v4.6.1</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
     <TargetFrameworkProfile />
     <PlatformTarget>AnyCPU</PlatformTarget>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -42,9 +44,11 @@
     <Compile Include="MockStorageProvider.cs" />
     <Compile Include="OrleansTestingBase.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="SerializationTestEnvironment.cs" />
     <Compile Include="TestCategory.cs" />
     <Compile Include="TestConstants.cs" />
     <Compile Include="TestDefaultConfiguration.cs" />
+    <Compile Include="TestEnvironmentFixture.cs" />
     <Compile Include="TestOutputHelperExtensions.cs" />
   </ItemGroup>
   <ItemGroup>

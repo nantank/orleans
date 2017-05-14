@@ -39,7 +39,7 @@ namespace Orleans.Runtime.Host
 
             Init(config.DeploymentId, config.DataConnectionString, logger);
 
-            return TaskDone.Done;
+            return Task.CompletedTask;
         }
 
         /// <summary>
@@ -57,7 +57,7 @@ namespace Orleans.Runtime.Host
         {
             Init(config.DeploymentId, config.DataConnectionString, logger);
 
-            return TaskDone.Done;
+            return Task.CompletedTask;
         }
 
         private void Init(String deploymentId, String dataConnectionString, Logger logger)
@@ -67,11 +67,7 @@ namespace Orleans.Runtime.Host
             _connectionString = dataConnectionString;
 
             _consulClient =
-                new ConsulClient(
-                    new ConsulClientConfiguration
-                    {
-                        Address = new Uri(dataConnectionString)
-                    });
+                new ConsulClient( config => config.Address = new Uri(_connectionString));
         }
 
         public async Task<MembershipTableData> ReadRow(SiloAddress siloAddress)
@@ -87,7 +83,7 @@ namespace Orleans.Runtime.Host
             if (deploymentKVAddresses.Response == null)
             {
                 _logger.Verbose("Could not find any silo registrations for deployment {0}.", _deploymentId);
-                return new MembershipTableData(null);
+                return new MembershipTableData(_tableVersion);
             }
 
             var allSiloRegistrations =

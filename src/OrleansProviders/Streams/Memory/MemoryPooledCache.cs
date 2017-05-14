@@ -13,7 +13,7 @@ namespace Orleans.Providers
     /// Pooled cache for memory stream provider
     /// </summary>
     public class MemoryPooledCache<TSerializer> : IQueueCache
-        where TSerializer : IMemoryMessageBodySerializer, new()
+        where TSerializer : class, IMemoryMessageBodySerializer
     {
         private readonly PooledQueueCache<MemoryMessageData, MemoryMessageData> cache;
 
@@ -22,11 +22,14 @@ namespace Orleans.Providers
         /// </summary>
         /// <param name="bufferPool"></param>
         /// <param name="logger"></param>
-        public MemoryPooledCache(IObjectPool<FixedSizeBuffer> bufferPool, Logger logger)
+        /// <param name="serializer"></param>
+        public MemoryPooledCache(IObjectPool<FixedSizeBuffer> bufferPool, Logger logger, TSerializer serializer)
         {
-            var dataAdapter = new CacheDataAdapter(bufferPool);
+            var dataAdapter = new CacheDataAdapter(bufferPool, serializer);
             cache = new PooledQueueCache<MemoryMessageData, MemoryMessageData>(dataAdapter, CacheDataComparer.Instance, logger);
-            dataAdapter.PurgeAction = cache.Purge;
+            var evictionStrategy = new ExplicitEvictionStrategy();
+            evictionStrategy.PurgeObservable = cache;
+            dataAdapter.OnBlockAllocated = evictionStrategy.OnBlockAllocated;
         }
 
         private class CacheDataComparer : ICacheDataComparer<MemoryMessageData>
@@ -48,20 +51,87 @@ namespace Orleans.Providers
             }
         }
 
+        private class ExplicitEvictionStrategy : IEvictionStrategy<MemoryMessageData>
+        {
+            private FixedSizeBuffer currentBuffer;
+            private Queue<FixedSizeBuffer> purgedBuffers;
+            public IPurgeObservable<MemoryMessageData> PurgeObservable { set; private get; }
+            public ExplicitEvictionStrategy()
+            {
+                this.purgedBuffers = new Queue<FixedSizeBuffer>();
+            }
+
+            public Action<MemoryMessageData?, MemoryMessageData?> OnPurged { get; set; }
+
+            //Explicitly purge all messages in purgeRequestBlock
+            public void PerformPurge(DateTime utcNow, IDisposable purgeRequest)
+            {
+                //if the cache is empty, then nothing to purge, return
+                if (this.PurgeObservable.IsEmpty)
+                    return;
+                var itemCountBeforePurge = this.PurgeObservable.ItemCount;
+                MemoryMessageData neweswtMessageInCache = this.PurgeObservable.Newest.Value;
+                MemoryMessageData? lastMessagePurged = null;
+                while (!this.PurgeObservable.IsEmpty)
+                {
+                    var oldestMessageInCache = this.PurgeObservable.Oldest.Value;
+                    if (!ShouldPurge(ref oldestMessageInCache, ref neweswtMessageInCache, purgeRequest))
+                    {
+                        break;
+                    }
+                    lastMessagePurged = oldestMessageInCache;
+                    this.PurgeObservable.RemoveOldestMessage();
+                }
+
+                //return purged buffer to the pool. except for the current buffer.
+                //if purgeCandidate is current buffer, put it in purgedBuffers and free it in next circle
+                var purgeCandidate = purgeRequest as FixedSizeBuffer;
+                this.purgedBuffers.Enqueue(purgeCandidate);
+                while (this.purgedBuffers.Count > 0)
+                {
+                    if (this.purgedBuffers.Peek() != this.currentBuffer)
+                    {
+                        this.purgedBuffers.Dequeue().Dispose();
+                    }
+                    else { break; }
+                }
+            }
+
+            public void OnBlockAllocated(IDisposable newBlock)
+            {
+                var newBuffer = newBlock as FixedSizeBuffer;
+                this.currentBuffer = newBuffer;
+                this.currentBuffer.SetPurgeAction(this.PerformPurge);
+            }
+
+            private bool ShouldPurge(ref MemoryMessageData cachedMessage, ref MemoryMessageData newestCachedMessage, IDisposable purgeRequest)
+            {
+                var purgedResource = (FixedSizeBuffer)purgeRequest;
+                return cachedMessage.Payload.Array == purgedResource.Id;
+            }
+
+            private void PerformPurge(IDisposable purgeRequest)
+            {
+                this.PerformPurge(DateTime.UtcNow, purgeRequest);
+            }
+        }
+
         private class CacheDataAdapter : ICacheDataAdapter<MemoryMessageData, MemoryMessageData>
         {
             private readonly IObjectPool<FixedSizeBuffer> bufferPool;
+            private readonly TSerializer serializer;
             private FixedSizeBuffer currentBuffer;
 
-            public Action<IDisposable> PurgeAction { private get; set; }
+            public Action<IDisposable> OnBlockAllocated { private get; set; }
 
-            public CacheDataAdapter(IObjectPool<FixedSizeBuffer> bufferPool)
+            public CacheDataAdapter(IObjectPool<FixedSizeBuffer> bufferPool, TSerializer serializer)
             {
                 if (bufferPool == null)
                 {
                     throw new ArgumentNullException(nameof(bufferPool));
                 }
                 this.bufferPool = bufferPool;
+                this.serializer = serializer;
             }
              
             public StreamPosition QueueMessageToCachedMessage(ref MemoryMessageData cachedMessage,
@@ -85,7 +155,10 @@ namespace Orleans.Providers
                 {
                     // no block or block full, get new block and try again
                     currentBuffer = bufferPool.Allocate();
-                    currentBuffer.SetPurgeAction(PurgeAction);
+                    if (this.OnBlockAllocated == null)
+                        throw new OrleansException("Eviction strategy's OnBlockAllocated is not set for current data adapter, this will affect cache purging");
+                    //call EvictionStrategy's OnBlockAllocated method
+                    this.OnBlockAllocated.Invoke(currentBuffer);
                     // if this fails with clean block, then requested size is too big
                     if (!currentBuffer.TryGetSegment(size, out segment))
                     {
@@ -102,7 +175,7 @@ namespace Orleans.Providers
             {
                 MemoryMessageData messageData = cachedMessage;
                 messageData.Payload = new ArraySegment<byte>(cachedMessage.Payload.ToArray());
-                return new MemoryBatchContainer<TSerializer>(messageData);
+                return new MemoryBatchContainer<TSerializer>(messageData, this.serializer);
             }
 
             public StreamSequenceToken GetSequenceToken(ref MemoryMessageData cachedMessage)
@@ -113,18 +186,7 @@ namespace Orleans.Providers
             public StreamPosition GetStreamPosition(MemoryMessageData queueMessage)
             {
                 return new StreamPosition(new StreamIdentity(queueMessage.StreamGuid, queueMessage.StreamNamespace),
-                    new EventSequenceToken(queueMessage.SequenceNumber));
-            }
-
-            public bool ShouldPurge(ref MemoryMessageData cachedMessage, ref MemoryMessageData newestCachedMessage, IDisposable purgeRequest, DateTime nowUtc)
-            {
-                var purgedResource = (FixedSizeBuffer) purgeRequest;
-                // if we're purging our current buffer, don't use it any more
-                if (currentBuffer != null && currentBuffer.Id == purgedResource.Id)
-                {
-                    currentBuffer = null;
-                }
-                return cachedMessage.Payload.Array == purgedResource.Id;
+                    new EventSequenceTokenV2(queueMessage.SequenceNumber));
             }
         }
 
@@ -163,7 +225,7 @@ namespace Orleans.Providers
                 return true;
             }
 
-            public void Refresh()
+            public void Refresh(StreamSequenceToken token)
             {
             }
 
@@ -225,5 +287,4 @@ namespace Orleans.Providers
             return false;
         }
     }
-
 }

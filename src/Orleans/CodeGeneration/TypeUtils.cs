@@ -233,7 +233,7 @@ namespace Orleans.Runtime
 
         public static Type[] GenericTypeArgsFromArgsString(string genericArgs)
         {
-            if (string.IsNullOrEmpty(genericArgs)) return new Type[] { };
+            if (string.IsNullOrEmpty(genericArgs)) return Type.EmptyTypes;
 
             var genericTypeDef = genericArgs.Replace("[]", "##"); // protect array arguments
 
@@ -372,6 +372,18 @@ namespace Orleans.Runtime
         }
 
         /// <summary>
+        /// Returns <see langword="true"/> if <paramref name="field"/> is marked as
+        /// <see cref="FieldAttributes.NotSerialized"/>, <see langword="false"/> otherwise.
+        /// </summary>
+        /// <param name="field">The field.</param>
+        /// <returns>
+        /// <see langword="true"/> if <paramref name="field"/> is marked as
+        /// <see cref="FieldAttributes.NotSerialized"/>, <see langword="false"/> otherwise.
+        /// </returns>
+        public static bool IsNotSerialized(this FieldInfo field)
+            => (field.Attributes & FieldAttributes.NotSerialized) == FieldAttributes.NotSerialized;
+
+        /// <summary>
         /// decide whether the class is derived from Grain
         /// </summary>
         public static bool IsGrainClass(Type type)
@@ -389,29 +401,6 @@ namespace Orleans.Runtime
             if (grainType == type || grainChevronType == type) return false;
 
             if (!grainType.IsAssignableFrom(type)) return false;
-
-            // exclude generated classes.
-            return !IsGeneratedType(type);
-        }
-
-        public static bool IsSystemTargetClass(Type type)
-        {
-            Type systemTargetType;
-            if (!TryResolveType("Orleans.Runtime.SystemTarget", out systemTargetType)) return false;
-
-            var systemTargetInterfaceType = typeof(ISystemTarget);
-            var systemTargetBaseInterfaceType = typeof(ISystemTargetBase);
-#if !NETSTANDARD
-            if (type.Assembly.ReflectionOnly)
-            {
-                systemTargetType = ToReflectionOnlyType(systemTargetType);
-                systemTargetInterfaceType = ToReflectionOnlyType(systemTargetInterfaceType);
-                systemTargetBaseInterfaceType = ToReflectionOnlyType(systemTargetBaseInterfaceType);
-            }
-#endif
-            if (!systemTargetInterfaceType.IsAssignableFrom(type) ||
-                !systemTargetBaseInterfaceType.IsAssignableFrom(type) ||
-                !systemTargetType.IsAssignableFrom(type)) return false;
 
             // exclude generated classes.
             return !IsGeneratedType(type);
@@ -491,7 +480,7 @@ namespace Orleans.Runtime
             var hasCopier = false;
             var hasSerializer = false;
             var hasDeserializer = false;
-            foreach (var method in type.GetMethods(BindingFlags.Static | BindingFlags.Public))
+            foreach (var method in type.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
             {
                 hasSerializer |= method.GetCustomAttribute<SerializerMethodAttribute>(false) != null;
                 hasDeserializer |= method.GetCustomAttribute<DeserializerMethodAttribute>(false) != null;
@@ -514,18 +503,6 @@ namespace Orleans.Runtime
             return generalType.IsAssignableFrom(type) && TypeHasAttribute(type, typeof(MethodInvokerAttribute));
         }
 
-#if NETSTANDARD_TODO
-        public static Type ResolveType(string fullName)
-        {
-            return Type.GetType(fullName, true);
-        }
-
-        public static bool TryResolveType(string fullName, out Type type)
-        {
-            type = Type.GetType(fullName, false);
-            return type != null;
-        }
-#else
         public static Type ResolveType(string fullName)
         {
             return CachedTypeResolver.Instance.ResolveType(fullName);
@@ -535,7 +512,7 @@ namespace Orleans.Runtime
         {
             return CachedTypeResolver.Instance.TryResolveType(fullName, out type);
         }
-
+#if !NETSTANDARD
         public static Type ResolveReflectionOnlyType(string assemblyQualifiedName)
         {
             return CachedReflectionOnlyTypeResolver.Instance.ResolveType(assemblyQualifiedName);
@@ -546,7 +523,6 @@ namespace Orleans.Runtime
             return type.Assembly.ReflectionOnly ? type : ResolveReflectionOnlyType(type.AssemblyQualifiedName);
         }
 #endif
-
         public static IEnumerable<Type> GetTypes(Assembly assembly, Predicate<Type> whereFunc, Logger logger)
         {
             return assembly.IsDynamic ? Enumerable.Empty<Type>() : GetDefinedTypes(assembly, logger).Select(t => t.AsType()).Where(type => !type.GetTypeInfo().IsNestedPrivate && whereFunc(type));
@@ -562,7 +538,8 @@ namespace Orleans.Runtime
             {
                 if (logger != null && logger.IsWarning)
                 {
-                    var message = $"AssemblyLoader encountered an exception loading types from assembly '{assembly.FullName}': {exception}";
+                    var message =
+                        $"Exception loading types from assembly '{assembly.FullName}': {LogFormatter.PrintException(exception)}.";
                     logger.Warn(ErrorCode.Loader_TypeLoadError_5, message, exception);
                 }
                 
@@ -889,6 +866,29 @@ namespace Orleans.Runtime
         /// The <see cref="PropertyInfo"/> for the simple member access call in the provided <paramref name="expression"/>.
         /// </returns>
         public static PropertyInfo Property<T, TResult>(Expression<Func<T, TResult>> expression)
+        {
+            var property = expression.Body as MemberExpression;
+            if (property != null)
+            {
+                return property.Member as PropertyInfo;
+            }
+
+            throw new ArgumentException("Expression type unsupported.");
+        }
+        
+        /// <summary>
+        /// Returns the <see cref="PropertyInfo"/> for the simple member access in the provided <paramref name="expression"/>.
+        /// </summary>
+        /// <typeparam name="TResult">
+        /// The return type of the property.
+        /// </typeparam>
+        /// <param name="expression">
+        /// The expression.
+        /// </param>
+        /// <returns>
+        /// The <see cref="PropertyInfo"/> for the simple member access call in the provided <paramref name="expression"/>.
+        /// </returns>
+        public static PropertyInfo Property<TResult>(Expression<Func<TResult>> expression)
         {
             var property = expression.Body as MemberExpression;
             if (property != null)

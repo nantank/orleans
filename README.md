@@ -1,17 +1,11 @@
 <p align="center">
   <img src="https://github.com/dotnet/orleans/blob/gh-pages/assets/logo_full.png" alt="Orleans logo" width="600px"> 
 </p>
-=======
 
-
-
-
-[![Build status](http://ci.dot.net/job/dotnet_orleans/job/master/job/netfx/badge/icon)](http://ci.dot.net/job/dotnet_orleans/job/master/)
+[![Build status](https://ci.dot.net/job/dotnet_orleans/job/master/job/netfx-bvt/badge/icon)](http://ci.dot.net/job/dotnet_orleans/job/master/)
 [![NuGet](https://img.shields.io/nuget/v/Microsoft.Orleans.Core.svg?style=flat)](http://www.nuget.org/profiles/Orleans)
-
 [![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/dotnet/orleans?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
-
-[![Help Wanted Issues](https://badge.waffle.io/dotnet/orleans.svg?label=up-for-grabs&title=Help Wanted Issues)](http://waffle.io/dotnet/orleans)
+[![Help Wanted Issues](https://badge.waffle.io/dotnet/orleans.svg?label=up-for-grabs&title=Help%20Wanted%20Issues)](http://waffle.io/dotnet/orleans)
 
 Orleans is a framework that provides a straight-forward approach to building distributed high-scale computing applications, without the need to learn and apply complex concurrency or other scaling patterns. 
 
@@ -48,7 +42,7 @@ PM> Install-Package Microsoft.Orleans.Client
 
 The stable production-quality release is located [here](https://github.com/dotnet/orleans/releases/latest).
 
-The latest clean development branch build from CI is located: [here](http://dotnet-ci.cloudapp.net/job/dotnet_orleans/job/innerloop/lastStableBuild/artifact/)
+The latest clean development branch build from CI is located: [here](https://ci.dot.net/job/dotnet_orleans/job/master/job/netfx-bvt/lastStableBuild/artifact/)
 
 ### Building From Source
 
@@ -92,6 +86,11 @@ var friend = GrainClient.GrainFactory.GetGrain<IHello>(0);
 // Send a greeting to the grain and await the response.
 Console.WriteLine(await friend.SayHello("Good morning, my friend!"));
 ```
+
+Blog
+=========
+[Orleans Blog](https://blogs.msdn.microsoft.com/orleans/) is a place to share our thoughts, plans, learnings, tips and tricks, and ideas, crazy and otherwise, which don’t easily fit the documentation format. We would also like to see here posts from the community members, sharing their experiences, ideas, and wisdom. 
+So, welcome to Orleans Blog, both as a reader and as a blogger!
 
 Community
 =========

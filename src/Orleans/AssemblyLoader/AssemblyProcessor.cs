@@ -31,6 +31,9 @@ namespace Orleans.Runtime
         /// The type metadata cache.
         /// </summary>
         private readonly TypeMetadataCache typeCache;
+        
+        private readonly SerializationManager serializationManager;
+        private readonly CodeGeneratorManager codeGeneratorManager;
 
         /// <summary>
         /// Whether or not this class has been initialized.
@@ -43,10 +46,18 @@ namespace Orleans.Runtime
         /// <param name="typeCache">
         /// The type cache.
         /// </param>
-        public AssemblyProcessor(TypeMetadataCache typeCache)
+        /// <param name="serializationManager">
+        /// The serialization manager.
+        /// </param>
+        /// <param name="codeGeneratorManager">
+        /// The code generator.
+        /// </param>
+        public AssemblyProcessor(TypeMetadataCache typeCache, SerializationManager serializationManager, CodeGeneratorManager codeGeneratorManager)
         {
             this.logger = LogManager.GetLogger("AssemblyProcessor");
             this.typeCache = typeCache;
+            this.serializationManager = serializationManager;
+            this.codeGeneratorManager = codeGeneratorManager;
         }
 
         /// <summary>
@@ -67,7 +78,7 @@ namespace Orleans.Runtime
                 }
 
                 // load the code generator before intercepting assembly loading
-                CodeGeneratorManager.Initialize(); 
+                codeGeneratorManager.Initialize(); 
 
                 // initialize serialization for all assemblies to be loaded.
                 AppDomain.CurrentDomain.AssemblyLoad += this.OnAssemblyLoad;
@@ -75,7 +86,20 @@ namespace Orleans.Runtime
                 Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
 
                 // initialize serialization for already loaded assemblies.
-                CodeGeneratorManager.GenerateAndCacheCodeForAllAssemblies();
+                var generated = codeGeneratorManager.GenerateAndLoadForAssemblies(assemblies);
+                if (generated != null)
+                {
+                    foreach (var generatedAssembly in generated)
+                    {
+                        this.ProcessAssembly(generatedAssembly?.Assembly);
+                    }
+                }
+
+                foreach (var generatedAssembly in CodeGeneratorManager.GetGeneratedAssemblies().Values)
+                {
+                    this.ProcessAssembly(generatedAssembly?.Assembly);
+                }
+
                 foreach (var assembly in assemblies)
                 {
                     this.ProcessAssembly(assembly);
@@ -101,6 +125,8 @@ namespace Orleans.Runtime
         /// <param name="assembly">The assembly to process.</param>
         private void ProcessAssembly(Assembly assembly)
         {
+            if (assembly == null) return;
+             
             string assemblyName = assembly.GetName().Name;
             if (this.logger.IsVerbose3)
             {
@@ -128,7 +154,8 @@ namespace Orleans.Runtime
             if (TypeUtils.IsOrleansOrReferencesOrleans(assembly))
             {
                 // Code generation occurs in a self-contained assembly, so invoke it separately.
-                CodeGeneratorManager.GenerateAndCacheCodeForAssembly(assembly);
+                var generated = codeGeneratorManager.GenerateAndCacheCodeForAssembly(assembly);
+                this.ProcessAssembly(generated?.Assembly);
             }
 
             // Process each type in the assembly.
@@ -146,8 +173,7 @@ namespace Orleans.Runtime
                         this.logger.Verbose3("Processing type {0}", typeName);
                     }
 
-                    SerializationManager.FindSerializationInfo(type);
-    
+                    this.serializationManager.FindSerializationInfo(type);
                     this.typeCache.FindSupportClasses(type);
                 }
                 catch (Exception exception)

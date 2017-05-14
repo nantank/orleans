@@ -1,4 +1,3 @@
-#if !NETSTANDARD_TODO
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -43,7 +42,9 @@ namespace Orleans.Runtime
         {
             IEnumerable<Assembly> assemblies = AppDomain.CurrentDomain.GetAssemblies();
             if (!TryPerformUncachedTypeResolution(name, out type, assemblies)) return false;
+#if !NETSTANDARD
             if (type.Assembly.ReflectionOnly) throw new InvalidOperationException(string.Format("Type resolution for {0} yielded reflection-only type.", name));
+#endif
             return true;
         }
 
@@ -73,9 +74,8 @@ namespace Orleans.Runtime
                 }
             }
 
-            type = null;
-            return false;
+            type = Type.GetType(fullName, throwOnError: false);
+            return type != null;
         }
     }
 }
-#endif

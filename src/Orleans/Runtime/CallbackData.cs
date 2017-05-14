@@ -20,14 +20,14 @@ namespace Orleans.Runtime
     {
         private readonly Action<Message, TaskCompletionSource<object>> callback;
         private readonly Func<Message, bool> resendFunc;
-        private readonly Action unregister;
+        private readonly Action<Message> unregister;
         private readonly TaskCompletionSource<object> context;
+        private readonly IMessagingConfiguration config;
 
         private bool alreadyFired;
-        private TimeSpan timeout; 
+        private TimeSpan timeout;
         private SafeTimer timer;
         private ITimeInterval timeSinceIssued;
-        private IMessagingConfiguration config;
         private static readonly Logger logger = LogManager.GetLogger("CallbackData");
 
         public Message Message { get; set; } // might hold metadata used by response pipeline
@@ -37,7 +37,7 @@ namespace Orleans.Runtime
             Func<Message, bool> resendFunc, 
             TaskCompletionSource<object> ctx, 
             Message msg, 
-            Action unregisterDelegate,
+            Action<Message> unregisterDelegate,
             IMessagingConfiguration config)
         {
             // We are never called without a callback func, but best to double check.
@@ -96,7 +96,7 @@ namespace Orleans.Runtime
             string errorMsg = $"Response did not arrive on time in {timeout} for message: {msg}. Target History is: {messageHistory}.";
             logger.Warn(ErrorCode.Runtime_Error_100157, "{0} About to break its promise.", errorMsg);
 
-            var error = msg.CreatePromptExceptionResponse(new TimeoutException(errorMsg));
+            var error = Message.CreatePromptExceptionResponse(msg, new TimeoutException(errorMsg));
             OnFail(msg, error, "OnTimeout - Resend {0} for {1}", true);
         }
 
@@ -111,7 +111,7 @@ namespace Orleans.Runtime
                 $"The target silo became unavailable for message: {msg}. Target History is: {messageHistory}. See {Constants.TroubleshootingHelpLink} for troubleshooting help.";
             logger.Warn(ErrorCode.Runtime_Error_100157, "{0} About to break its promise.", errorMsg);
 
-            var error = msg.CreatePromptExceptionResponse(new SiloUnavailableException(errorMsg));
+            var error = Message.CreatePromptExceptionResponse(msg, new SiloUnavailableException(errorMsg));
             OnFail(msg, error, "On silo fail - Resend {0} for {1}");
         }
 
@@ -138,7 +138,7 @@ namespace Orleans.Runtime
                 {
                     timeSinceIssued.Stop();
                 }
-                unregister?.Invoke();
+                unregister?.Invoke(Message);
             }
             if (StatisticsCollector.CollectApplicationRequestsStats)
             {
@@ -188,7 +188,7 @@ namespace Orleans.Runtime
                     timeSinceIssued.Stop();
                 }
 
-                unregister?.Invoke();
+                unregister?.Invoke(Message);
             }
             
             if (StatisticsCollector.CollectApplicationRequestsStats)

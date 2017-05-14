@@ -19,6 +19,14 @@ namespace UnitTests.StorageTests
     }
 
     [Serializable]
+    public struct ErrorInjectionBehavior
+    {
+        public static readonly ErrorInjectionBehavior None = new ErrorInjectionBehavior { ErrorInjectionPoint = ErrorInjectionPoint.None };
+        public Type ExceptionType { get; set; }
+        public ErrorInjectionPoint ErrorInjectionPoint { get; set; }
+    }
+
+    [Serializable]
     public class StorageProviderInjectedError : Exception
     {
         private readonly ErrorInjectionPoint errorInjectionPoint;
@@ -47,13 +55,24 @@ namespace UnitTests.StorageTests
         }
     }
 
-    public class ErrorInjectionStorageProvider : MockStorageProvider
+    public class ErrorInjectionStorageProvider : MockStorageProvider, IControllable
     {
-        public ErrorInjectionPoint ErrorInjection { get; private set; }
+        public static void SetErrorInjection(string providerName, ErrorInjectionBehavior errorInjectionBehavior, IGrainFactory grainFactory)
+        {
+            IManagementGrain mgmtGrain = grainFactory.GetGrain<IManagementGrain>(0);
+            mgmtGrain.SendControlCommandToProvider(
+                typeof(ErrorInjectionStorageProvider).FullName,
+                providerName, 
+                (int)Commands.SetErrorInjection,
+                errorInjectionBehavior)
+                .Wait();
+        }
+
+        public ErrorInjectionBehavior ErrorInjection { get; private set; }
 
         internal static bool DoInjectErrors = true;
 
-        public void SetErrorInjection(ErrorInjectionPoint errorInject)
+        public void SetErrorInjection(ErrorInjectionBehavior errorInject)
         {
             ErrorInjection = errorInject;
             Log.Info(0, "Set ErrorInjection to {0}", ErrorInjection);
@@ -65,7 +84,7 @@ namespace UnitTests.StorageTests
             Log.Info(0, "Init ErrorInjection={0}", ErrorInjection);
             try
             {
-                SetErrorInjection(ErrorInjectionPoint.None);
+                SetErrorInjection(ErrorInjectionBehavior.None);
                 await base.Init(name, providerRuntime, config);
             }
             catch (Exception exc)
@@ -80,7 +99,7 @@ namespace UnitTests.StorageTests
             Log.Info(0, "Close ErrorInjection={0}", ErrorInjection);
             try
             {
-                SetErrorInjection(ErrorInjectionPoint.None);
+                SetErrorInjection(ErrorInjectionBehavior.None);
                 await base.Close();
             }
             catch (Exception exc)
@@ -95,9 +114,9 @@ namespace UnitTests.StorageTests
             Log.Info(0, "ReadStateAsync for {0} {1} ErrorInjection={2}", grainType, grainReference, ErrorInjection);
             try
             {
-                if (ErrorInjection == ErrorInjectionPoint.BeforeRead && DoInjectErrors) throw new StorageProviderInjectedError(ErrorInjection);
+                ThrowIfMatches(ErrorInjectionPoint.BeforeRead);
                 await base.ReadStateAsync(grainType, grainReference, grainState);
-                if (ErrorInjection == ErrorInjectionPoint.AfterRead && DoInjectErrors) throw new StorageProviderInjectedError(ErrorInjection);
+                ThrowIfMatches(ErrorInjectionPoint.AfterRead);
             }
             catch (Exception exc)
             {
@@ -111,9 +130,9 @@ namespace UnitTests.StorageTests
             Log.Info(0, "WriteStateAsync for {0} {1} ErrorInjection={0}", grainType, grainReference, ErrorInjection);
             try
             {
-                if (ErrorInjection == ErrorInjectionPoint.BeforeWrite && DoInjectErrors) throw new StorageProviderInjectedError(ErrorInjection);
+                ThrowIfMatches(ErrorInjectionPoint.BeforeWrite);
                 await base.WriteStateAsync(grainType, grainReference, grainState);
-                if (ErrorInjection == ErrorInjectionPoint.AfterWrite && DoInjectErrors) throw new StorageProviderInjectedError(ErrorInjection);
+                ThrowIfMatches(ErrorInjectionPoint.AfterWrite);
             }
             catch (Exception exc)
             {
@@ -121,5 +140,39 @@ namespace UnitTests.StorageTests
                 throw;
             }
         }
+
+        private void ThrowIfMatches(ErrorInjectionPoint executingPoint)
+        {
+            if (DoInjectErrors && ErrorInjection.ErrorInjectionPoint == executingPoint)
+            {
+                if (ErrorInjection.ExceptionType == null || ErrorInjection.ExceptionType == typeof(StorageProviderInjectedError))
+                {
+                    throw new StorageProviderInjectedError(ErrorInjection.ErrorInjectionPoint);
+                }
+                else
+                {
+                    throw ((Exception)Activator.CreateInstance(ErrorInjection.ExceptionType));
+                }
+            }
+        }
+
+        #region IControllable interface methods
+        /// <summary>
+        /// A function to execute a control command.
+        /// </summary>
+        /// <param name="command">A serial number of the command.</param>
+        /// <param name="arg">An opaque command argument</param>
+        public override Task<object> ExecuteCommand(int command, object arg)
+        { 
+            switch ((Commands)command)
+            {
+                case Commands.SetErrorInjection:
+                    SetErrorInjection((ErrorInjectionBehavior)arg);
+                    return Task.FromResult<object>(true);
+                default:
+                    return base.ExecuteCommand(command, arg);
+            }
+        }
+        #endregion
     }
 }

@@ -115,10 +115,11 @@ namespace OrleansAWSUtils.Storage
 
         private void CreateClient()
         {
-            if (service.StartsWith("http://", StringComparison.InvariantCultureIgnoreCase) ||
-                service.StartsWith("https://", StringComparison.InvariantCultureIgnoreCase))
+            if (service.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                service.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
             {
-                ddbClient = new AmazonDynamoDBClient(new AmazonDynamoDBConfig { ServiceURL = service });
+                var credentials = new BasicAWSCredentials("dummy", "dummyKey");
+                ddbClient = new AmazonDynamoDBClient(credentials, new AmazonDynamoDBConfig { ServiceURL = service });
             }
             else
             {
@@ -377,7 +378,7 @@ namespace OrleansAWSUtils.Storage
             if (toDelete == null) throw new ArgumentNullException("collection");
 
             if (toDelete.Count == 0)
-                return TaskDone.Done;
+                return Task.CompletedTask;
 
             try
             {
@@ -538,7 +539,7 @@ namespace OrleansAWSUtils.Storage
             if (toCreate == null) throw new ArgumentNullException("collection");
 
             if (toCreate.Count == 0)
-                return TaskDone.Done;
+                return Task.CompletedTask;
 
             try
             {

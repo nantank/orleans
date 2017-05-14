@@ -24,12 +24,18 @@ namespace Orleans.Runtime
 
         public void QueueRequest(T request)
         {
+            if (requestQueue==null)
+            {
+                return;
+            }
+
 #if TRACK_DETAILED_STATS
             if (StatisticsCollector.CollectQueueStats)
             {
                 queueTracking.OnEnQueueRequest(1, requestQueue.Count, request);
             }
 #endif
+
             requestQueue.Add(request);
         }
 
@@ -65,7 +71,7 @@ namespace Orleans.Runtime
         {            
             while (true)
             {
-                if (Cts.IsCancellationRequested)
+                if (Cts == null || Cts.IsCancellationRequested)
                 {
                     return;
                 }
@@ -108,7 +114,7 @@ namespace Orleans.Runtime
                 threadTracking.OnStopExecution();
             }
 #endif
-            requestQueue.CompleteAdding();
+            requestQueue?.CompleteAdding();
             base.Stop();
         }
 
@@ -143,11 +149,8 @@ namespace Orleans.Runtime
 #endif
             base.Dispose(disposing);
 
-            if (requestQueue != null)
-            {
-                requestQueue.Dispose();
-                requestQueue = null;
-            }
+            requestQueue?.Dispose();
+            requestQueue = null;
         }
 
         #endregion

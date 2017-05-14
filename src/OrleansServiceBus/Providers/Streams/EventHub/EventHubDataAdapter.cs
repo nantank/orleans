@@ -3,9 +3,16 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+#if NETSTANDARD
+using Microsoft.Azure.EventHubs;
+#else
 using Microsoft.ServiceBus.Messaging;
+#endif
 using Orleans.Providers.Streams.Common;
+using Orleans.Serialization;
 using Orleans.Streams;
+using System.Collections.Concurrent;
+using Orleans.Runtime;
 
 namespace Orleans.ServiceBus.Providers
 {
@@ -71,7 +78,8 @@ namespace Orleans.ServiceBus.Providers
         /// Duplicate of EventHub's EventData class.
         /// </summary>
         /// <param name="cachedMessage"></param>
-        public EventHubMessage(CachedEventHubMessage cachedMessage)
+        /// <param name="serializationManager"></param>
+        public EventHubMessage(CachedEventHubMessage cachedMessage, SerializationManager serializationManager)
         {
             int readOffset = 0;
             StreamIdentity = new StreamIdentity(cachedMessage.StreamGuid, SegmentBuilder.ReadNextString(cachedMessage.Segment, ref readOffset));
@@ -80,7 +88,7 @@ namespace Orleans.ServiceBus.Providers
             SequenceNumber = cachedMessage.SequenceNumber;
             EnqueueTimeUtc = cachedMessage.EnqueueTimeUtc;
             DequeueTimeUtc = cachedMessage.DequeueTimeUtc;
-            Properties = SegmentBuilder.ReadNextBytes(cachedMessage.Segment, ref readOffset).DeserializeProperties();
+            Properties = SegmentBuilder.ReadNextBytes(cachedMessage.Segment, ref readOffset).DeserializeProperties(serializationManager);
             Payload = SegmentBuilder.ReadNextBytes(cachedMessage.Segment, ref readOffset).ToArray();
         }
 
@@ -134,9 +142,7 @@ namespace Orleans.ServiceBus.Providers
         public int Compare(CachedEventHubMessage cachedMessage, StreamSequenceToken streamToken)
         {
             var realToken = (EventSequenceToken)streamToken;
-            return cachedMessage.SequenceNumber != realToken.SequenceNumber
-                ? (int)(cachedMessage.SequenceNumber - realToken.SequenceNumber)
-                : 0 - realToken.EventIndex;
+            return (int)(cachedMessage.SequenceNumber - realToken.SequenceNumber);
         }
 
         /// <summary>
@@ -158,28 +164,26 @@ namespace Orleans.ServiceBus.Providers
     /// </summary>
     public class EventHubDataAdapter : ICacheDataAdapter<EventData, CachedEventHubMessage>
     {
+        private readonly SerializationManager serializationManager;
         private readonly IObjectPool<FixedSizeBuffer> bufferPool;
-        private readonly TimePurgePredicate timePurage;
         private FixedSizeBuffer currentBuffer;
 
-        /// <summary>
-        /// Assignable purge action.  This is called when a purge request is triggered.
-        /// </summary>
-        public Action<IDisposable> PurgeAction { private get; set; }
+        /// <inheritdoc />
+        public Action<IDisposable> OnBlockAllocated { set; private get; }
 
         /// <summary>
         /// Cache data adapter that adapts EventHub's EventData to CachedEventHubMessage used in cache
         /// </summary>
+        /// <param name="serializationManager"></param>
         /// <param name="bufferPool"></param>
-        /// <param name="timePurage"></param>
-        public EventHubDataAdapter(IObjectPool<FixedSizeBuffer> bufferPool, TimePurgePredicate timePurage = null)
+        public EventHubDataAdapter(SerializationManager serializationManager, IObjectPool<FixedSizeBuffer> bufferPool)
         {
             if (bufferPool == null)
             {
                 throw new ArgumentNullException(nameof(bufferPool));
             }
+            this.serializationManager = serializationManager;
             this.bufferPool = bufferPool;
-            this.timePurage = timePurage ?? TimePurgePredicate.Default;
         }
 
         /// <summary>
@@ -193,8 +197,13 @@ namespace Orleans.ServiceBus.Providers
         {
             StreamPosition streamPosition = GetStreamPosition(queueMessage);
             cachedMessage.StreamGuid = streamPosition.StreamIdentity.Guid;
+#if NETSTANDARD
+            cachedMessage.SequenceNumber = queueMessage.SystemProperties.SequenceNumber;
+            cachedMessage.EnqueueTimeUtc = queueMessage.SystemProperties.EnqueuedTimeUtc;
+#else
             cachedMessage.SequenceNumber = queueMessage.SequenceNumber;
-            cachedMessage.EnqueueTimeUtc = queueMessage.EnqueuedTimeUtc;
+            cachedMessage.EnqueueTimeUtc = queueMessage.EnqueuedTimeUtc; 
+#endif
             cachedMessage.DequeueTimeUtc = dequeueTimeUtc;
             cachedMessage.Segment = EncodeMessageIntoSegment(streamPosition, queueMessage);
             return streamPosition;
@@ -207,7 +216,7 @@ namespace Orleans.ServiceBus.Providers
         /// <returns></returns>
         public IBatchContainer GetBatchContainer(ref CachedEventHubMessage cachedMessage)
         {
-            var evenHubMessage = new EventHubMessage(cachedMessage);
+            var evenHubMessage = new EventHubMessage(cachedMessage, this.serializationManager);
             return GetBatchContainer(evenHubMessage);
         }
 
@@ -218,7 +227,7 @@ namespace Orleans.ServiceBus.Providers
         /// <returns></returns>
         protected virtual IBatchContainer GetBatchContainer(EventHubMessage eventHubMessage)
         {
-            return new EventHubBatchContainer(eventHubMessage);
+            return new EventHubBatchContainer(eventHubMessage, this.serializationManager);
         }
 
         /// <summary>
@@ -228,7 +237,7 @@ namespace Orleans.ServiceBus.Providers
         /// <returns></returns>
         public virtual StreamSequenceToken GetSequenceToken(ref CachedEventHubMessage cachedMessage)
         {
-            return new EventSequenceToken(cachedMessage.SequenceNumber, 0);
+            return new EventHubSequenceTokenV2("", cachedMessage.SequenceNumber, 0);
         }
 
         /// <summary>
@@ -238,41 +247,21 @@ namespace Orleans.ServiceBus.Providers
         /// <returns></returns>
         public virtual StreamPosition GetStreamPosition(EventData queueMessage)
         {
-            Guid streamGuid = Guid.Parse(queueMessage.PartitionKey);
+            Guid streamGuid =
+#if NETSTANDARD
+            Guid.Parse(queueMessage.SystemProperties.PartitionKey);
+#else
+            Guid.Parse(queueMessage.PartitionKey); 
+#endif
             string streamNamespace = queueMessage.GetStreamNamespaceProperty();
             IStreamIdentity stremIdentity = new StreamIdentity(streamGuid, streamNamespace);
-            StreamSequenceToken token = new EventSequenceToken(queueMessage.SequenceNumber, 0);
+            StreamSequenceToken token =
+#if NETSTANDARD
+                new EventHubSequenceTokenV2(queueMessage.SystemProperties.Offset, queueMessage.SystemProperties.SequenceNumber, 0);
+#else
+                new EventHubSequenceTokenV2(queueMessage.Offset, queueMessage.SequenceNumber, 0); 
+#endif
             return new StreamPosition(stremIdentity, token);
-        }
-
-        /// <summary>
-        /// Given a purge request, indicates if a cached message should be purged from the cache
-        /// </summary>
-        /// <param name="cachedMessage"></param>
-        /// <param name="newestCachedMessage"></param>
-        /// <param name="purgeRequest"></param>
-        /// <param name="nowUtc"></param>
-        /// <returns></returns>
-        public bool ShouldPurge(ref CachedEventHubMessage cachedMessage, ref CachedEventHubMessage newestCachedMessage, IDisposable purgeRequest, DateTime nowUtc)
-        {
-            // if we're purging our current buffer, don't use it any more
-            var purgedResource = (FixedSizeBuffer)purgeRequest;
-            if (currentBuffer != null && currentBuffer.Id == purgedResource.Id)
-            {
-                currentBuffer = null;
-            }
-
-            TimeSpan timeInCache = nowUtc - cachedMessage.DequeueTimeUtc;
-            // age of message relative to the most recent event in the cache.
-            TimeSpan relativeAge = newestCachedMessage.EnqueueTimeUtc - cachedMessage.EnqueueTimeUtc;
-
-            return ShouldPurgeFromResource(ref cachedMessage, purgedResource) || timePurage.ShouldPurgFromTime(timeInCache, relativeAge);
-        }
-
-        private static bool ShouldPurgeFromResource(ref CachedEventHubMessage cachedMessage, FixedSizeBuffer purgedResource)
-        {
-            // if message is from this resource, purge
-            return cachedMessage.Segment.Array == purgedResource.Id;
         }
 
         private ArraySegment<byte> GetSegment(int size)
@@ -283,7 +272,10 @@ namespace Orleans.ServiceBus.Providers
             {
                 // no block or block full, get new block and try again
                 currentBuffer = bufferPool.Allocate();
-                currentBuffer.SetPurgeAction(PurgeAction);
+                if (this.OnBlockAllocated == null)
+                    throw new OrleansException("Eviction strategy's OnBlockAllocated is not set for current data adapter, this will affect cache purging");
+                //call EvictionStrategy's OnBlockAllocated method
+                this.OnBlockAllocated.Invoke(currentBuffer);
                 // if this fails with clean block, then requested size is too big
                 if (!currentBuffer.TryGetSegment(size, out segment))
                 {
@@ -298,12 +290,21 @@ namespace Orleans.ServiceBus.Providers
         // Placed object message payload into a segment.
         private ArraySegment<byte> EncodeMessageIntoSegment(StreamPosition streamPosition, EventData queueMessage)
         {
-            byte[] propertiesBytes = queueMessage.SerializeProperties();
-            byte[] payload = queueMessage.GetBytes();
+            byte[] propertiesBytes = queueMessage.SerializeProperties(this.serializationManager);
+#if NETSTANDARD
+            byte[] payload = queueMessage.Body.Array;
+#else
+            byte[] payload = queueMessage.GetBytes(); 
+#endif
             // get size of namespace, offset, partitionkey, properties, and payload
             int size = SegmentBuilder.CalculateAppendSize(streamPosition.StreamIdentity.Namespace) +
+#if NETSTANDARD
+            SegmentBuilder.CalculateAppendSize(queueMessage.SystemProperties.Offset) +
+            SegmentBuilder.CalculateAppendSize(queueMessage.SystemProperties.PartitionKey) +
+#else
             SegmentBuilder.CalculateAppendSize(queueMessage.Offset) +
-            SegmentBuilder.CalculateAppendSize(queueMessage.PartitionKey) +
+            SegmentBuilder.CalculateAppendSize(queueMessage.PartitionKey) + 
+#endif
             SegmentBuilder.CalculateAppendSize(propertiesBytes) +
             SegmentBuilder.CalculateAppendSize(payload);
 
@@ -313,12 +314,18 @@ namespace Orleans.ServiceBus.Providers
             // encode namespace, offset, partitionkey, properties and payload into segment
             int writeOffset = 0;
             SegmentBuilder.Append(segment, ref writeOffset, streamPosition.StreamIdentity.Namespace);
+#if NETSTANDARD
+            SegmentBuilder.Append(segment, ref writeOffset, queueMessage.SystemProperties.Offset);
+            SegmentBuilder.Append(segment, ref writeOffset, queueMessage.SystemProperties.PartitionKey);
+#else
             SegmentBuilder.Append(segment, ref writeOffset, queueMessage.Offset);
-            SegmentBuilder.Append(segment, ref writeOffset, queueMessage.PartitionKey);
+            SegmentBuilder.Append(segment, ref writeOffset, queueMessage.PartitionKey); 
+#endif
             SegmentBuilder.Append(segment, ref writeOffset, propertiesBytes);
             SegmentBuilder.Append(segment, ref writeOffset, payload);
 
             return segment;
         }
+       
     }
 }

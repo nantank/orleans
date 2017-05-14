@@ -10,6 +10,7 @@ namespace Orleans.Runtime
     internal class UniqueKey : IComparable<UniqueKey>, IEquatable<UniqueKey>
     {
         private const ulong TYPE_CODE_DATA_MASK = 0xFFFFFFFF; // Lowest 4 bytes
+        private static readonly char[] KeyExtSeparationChar = {'+'};
 
         /// <summary>
         /// Type id values encoded into UniqueKeys
@@ -87,7 +88,7 @@ namespace Orleans.Runtime
                 return NewKey(guid);
             else
             {
-                var fields = trimmed.Split('+');
+                var fields = trimmed.Split(KeyExtSeparationChar, 2);
                 var n0 = ulong.Parse(fields[0].Substring(0, 16), NumberStyles.HexNumber);
                 var n1 = ulong.Parse(fields[0].Substring(16, 16), NumberStyles.HexNumber);
                 var typeCodeData = ulong.Parse(fields[0].Substring(32, 16), NumberStyles.HexNumber);
@@ -111,11 +112,6 @@ namespace Orleans.Runtime
 
         private static UniqueKey NewKey(ulong n0, ulong n1, Category category, long typeData, string keyExt)
         {
-            // in the string representation of a key, we grab the least significant half of n1.
-            // therefore, if n0 is non-zero and n1 is 0, then the string representation will always be
-            // 0x0 and not useful for identification of the grain.
-            if (n1 == 0 && n1 != 0)
-                throw new ArgumentException("n0 cannot be zero unless n1 is non-zero.", "n0");
             if (category != Category.KeyExtGrain && category != Category.GeoClient && keyExt != null)
                 throw new ArgumentException("Only key extended grains can specify a non-null key extension.");
 
@@ -159,6 +155,12 @@ namespace Orleans.Runtime
         {
             ulong n1 = unchecked((ulong)systemId);
             return NewKey(0, n1, Category.SystemTarget, 0, null);
+        }
+
+        public static UniqueKey NewGrainServiceKey(short key, long typeData)
+        {
+            ulong n1 = unchecked((ulong)key);
+            return NewKey(0, n1, Category.SystemTarget, typeData, null);
         }
 
         internal static UniqueKey NewKey(ulong n0, ulong n1, ulong typeCodeData, string keyExt)

@@ -1,15 +1,18 @@
-﻿
-
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+#if NETSTANDARD
+using Microsoft.Azure.EventHubs;
+#else
 using Microsoft.ServiceBus.Messaging;
+#endif
 using Orleans.Providers.Streams.Common;
 using Orleans.Runtime;
 using Orleans.Streams;
+using Orleans.Runtime.Configuration;
 
 namespace Orleans.ServiceBus.Providers
 {
@@ -32,14 +35,20 @@ namespace Orleans.ServiceBus.Providers
         private readonly IEventHubReceiverMonitor monitor;
 
         private IEventHubQueueCache cache;
-        private EventHubReceiver receiver;
+
+        private IEventHubReceiver receiver;
+
+        private Func<EventHubPartitionSettings, string, Logger, Task<IEventHubReceiver>> eventHubReceiverFactory;
+
         private IStreamQueueCheckpointer<string> checkpointer;
         private AggregatedQueueFlowController flowController;
 
         // Receiver life cycle
         private int recieverState = ReceiverShutdown;
+
         private const int ReceiverShutdown = 0;
         private const int ReceiverRunning = 1;
+        private readonly Func<NodeConfiguration> getNodeConfig;
 
         public int GetMaxAddCount()
         {
@@ -50,7 +59,9 @@ namespace Orleans.ServiceBus.Providers
             Func<string, IStreamQueueCheckpointer<string>, Logger, IEventHubQueueCache> cacheFactory,
             Func<string, Task<IStreamQueueCheckpointer<string>>> checkpointerFactory,
             Logger baseLogger,
-            IEventHubReceiverMonitor monitor)
+            IEventHubReceiverMonitor monitor,
+            Func<NodeConfiguration> getNodeConfig,
+            Func<EventHubPartitionSettings, string, Logger, Task<IEventHubReceiver>> eventHubReceiverFactory = null)
         {
             if (settings == null) throw new ArgumentNullException(nameof(settings));
             if (cacheFactory == null) throw new ArgumentNullException(nameof(cacheFactory));
@@ -63,6 +74,9 @@ namespace Orleans.ServiceBus.Providers
             this.baseLogger = baseLogger;
             this.logger = baseLogger.GetSubLogger("receiver", "-");
             this.monitor = monitor;
+            this.getNodeConfig = getNodeConfig;
+
+            this.eventHubReceiverFactory = eventHubReceiverFactory == null ? EventHubAdapterReceiver.CreateReceiver : eventHubReceiverFactory;
         }
 
         public Task Initialize(TimeSpan timeout)
@@ -70,10 +84,9 @@ namespace Orleans.ServiceBus.Providers
             logger.Info("Initializing EventHub partition {0}-{1}.", settings.Hub.Path, settings.Partition);
             // if receiver was already running, do nothing
             return ReceiverRunning == Interlocked.Exchange(ref recieverState, ReceiverRunning)
-                ? TaskDone.Done
+                ? Task.CompletedTask
                 : Initialize();
         }
-
         /// <summary>
         /// Initialization of EventHub receiver is performed at adapter reciever initialization, but if it fails,
         ///  it will be retried when messages are requested
@@ -85,9 +98,9 @@ namespace Orleans.ServiceBus.Providers
             {
                 checkpointer = await checkpointerFactory(settings.Partition);
                 cache = cacheFactory(settings.Partition, checkpointer, baseLogger);
-                flowController = new AggregatedQueueFlowController(MaxMessagesPerRead) {cache, LoadShedQueueFlowController.CreateAsPercentOfLoadSheddingLimit()};
+                flowController = new AggregatedQueueFlowController(MaxMessagesPerRead) { cache, LoadShedQueueFlowController.CreateAsPercentOfLoadSheddingLimit(getNodeConfig) };
                 string offset = await checkpointer.Load();
-                receiver = await CreateReceiver(settings, offset, logger);
+                receiver = await this.eventHubReceiverFactory(settings, offset, logger);
                 monitor.TrackInitialization(true);
             }
             catch (Exception)
@@ -121,11 +134,11 @@ namespace Orleans.ServiceBus.Providers
             try
             {
                 var watch = Stopwatch.StartNew();
-                messages = (await receiver.ReceiveAsync(maxCount, ReceiveTimeout)).ToList();
+                messages = (await receiver.ReceiveAsync(maxCount, ReceiveTimeout))?.ToList();
                 watch.Stop();
 
                 monitor.TrackRead(true);
-                monitor.TrackMessagesRecieved(messages.Count, watch.Elapsed);
+                monitor.TrackMessagesRecieved(messages?.Count ?? 0, watch.Elapsed);
             }
             catch (Exception ex)
             {
@@ -137,15 +150,20 @@ namespace Orleans.ServiceBus.Providers
             }
 
             var batches = new List<IBatchContainer>();
-            if (messages.Count == 0)
+            if (messages == null || messages.Count == 0)
             {
                 return batches;
             }
 
             // monitor message age
             var dequeueTimeUtc = DateTime.UtcNow;
+#if NETSTANDARD
+            TimeSpan oldest = dequeueTimeUtc - messages[0].SystemProperties.EnqueuedTimeUtc;
+            TimeSpan newest = dequeueTimeUtc - messages[messages.Count - 1].SystemProperties.EnqueuedTimeUtc;
+#else
             TimeSpan oldest = dequeueTimeUtc - messages[0].EnqueuedTimeUtc;
             TimeSpan newest = dequeueTimeUtc - messages[messages.Count - 1].EnqueuedTimeUtc;
+#endif
             monitor.TrackAgeOfMessagesRead(oldest, newest);
 
             foreach (EventData message in messages)
@@ -157,7 +175,13 @@ namespace Orleans.ServiceBus.Providers
 
             if (!checkpointer.CheckpointExists)
             {
-                checkpointer.Update(messages[0].Offset, DateTime.UtcNow);
+                checkpointer.Update(
+#if NETSTANDARD
+                    messages[0].SystemProperties.Offset,
+#else
+                    messages[0].Offset,
+#endif
+                    DateTime.UtcNow);
             }
             return batches;
         }
@@ -170,6 +194,10 @@ namespace Orleans.ServiceBus.Providers
         public bool TryPurgeFromCache(out IList<IBatchContainer> purgedItems)
         {
             purgedItems = null;
+
+            //if not under pressure, signal the cache to do a time based purge
+            if (!this.IsUnderPressure())
+                this.cache.SignalPurge();
             return false;
         }
 
@@ -180,12 +208,12 @@ namespace Orleans.ServiceBus.Providers
 
         public bool IsUnderPressure()
         {
-            return false;
+            return this.GetMaxAddCount() <= 0;
         }
 
         public Task MessagesDeliveredAsync(IList<IBatchContainer> messages)
         {
-            return TaskDone.Done;
+            return Task.CompletedTask;
         }
 
         public async Task Shutdown(TimeSpan timeout)
@@ -202,9 +230,11 @@ namespace Orleans.ServiceBus.Providers
 
                 // clear cache and receiver
                 IEventHubQueueCache localCache = Interlocked.Exchange(ref cache, null);
-                EventHubReceiver localReceiver = Interlocked.Exchange(ref receiver, null);
+
+                var localReceiver = Interlocked.Exchange(ref receiver, null);
+
                 // start closing receiver
-                Task closeTask = TaskDone.Done;
+                Task closeTask = Task.CompletedTask;
                 if (localReceiver != null)
                 {
                     closeTask = localReceiver.CloseAsync();
@@ -224,31 +254,70 @@ namespace Orleans.ServiceBus.Providers
             }
         }
 
-        private static async Task<EventHubReceiver> CreateReceiver(EventHubPartitionSettings partitionSettings, string offset, Logger logger)
+        private static async Task<IEventHubReceiver> CreateReceiver(EventHubPartitionSettings partitionSettings, string offset, Logger logger)
         {
             bool offsetInclusive = true;
+#if NETSTANDARD
+            var connectionStringBuilder = new EventHubsConnectionStringBuilder(partitionSettings.Hub.ConnectionString)
+            {
+                EntityPath = partitionSettings.Hub.Path
+            };
+            EventHubClient client = EventHubClient.CreateFromConnectionString(connectionStringBuilder.ToString());
+#else
             EventHubClient client = EventHubClient.CreateFromConnectionString(partitionSettings.Hub.ConnectionString, partitionSettings.Hub.Path);
+
             EventHubConsumerGroup consumerGroup = client.GetConsumerGroup(partitionSettings.Hub.ConsumerGroup);
             if (partitionSettings.Hub.PrefetchCount.HasValue)
             {
                 consumerGroup.PrefetchCount = partitionSettings.Hub.PrefetchCount.Value;
             }
+#endif
             // if we have a starting offset or if we're not configured to start reading from utc now, read from offset
-            if (!partitionSettings.Hub.StartFromNow || offset != EventHubConsumerGroup.StartOfStream)
+            if (!partitionSettings.Hub.StartFromNow ||
+                offset != EventHubConstants.StartOfStream)
             {
                 logger.Info("Starting to read from EventHub partition {0}-{1} at offset {2}", partitionSettings.Hub.Path, partitionSettings.Partition, offset);
             }
             else
             {
                 // to start reading from most recent data, we get the latest offset from the partition.
-                PartitionRuntimeInformation patitionInfo =
+#if NETSTANDARD
+                EventHubPartitionRuntimeInformation partitionInfo =
+#else
+                PartitionRuntimeInformation partitionInfo =
+#endif
                     await client.GetPartitionRuntimeInformationAsync(partitionSettings.Partition);
-                offset = patitionInfo.LastEnqueuedOffset;
+                offset = partitionInfo.LastEnqueuedOffset;
                 offsetInclusive = false;
                 logger.Info("Starting to read latest messages from EventHub partition {0}-{1} at offset {2}", partitionSettings.Hub.Path, partitionSettings.Partition, offset);
             }
-            return await consumerGroup.CreateReceiverAsync(partitionSettings.Partition, offset, offsetInclusive);
+#if NETSTANDARD
+            PartitionReceiver receiver = client.CreateReceiver(partitionSettings.Hub.ConsumerGroup, partitionSettings.Partition, offset, offsetInclusive);
+
+            if (partitionSettings.Hub.PrefetchCount.HasValue)
+                receiver.PrefetchCount = partitionSettings.Hub.PrefetchCount.Value;
+
+            return new EventHubReceiverProxy(receiver);
+#else
+            return new EventHubReceiverProxy(await consumerGroup.CreateReceiverAsync(partitionSettings.Partition, offset, offsetInclusive));
+#endif
         }
+
+#region EventHubGeneratorStreamProvider related region
+        /// <summary>
+        /// For test purpose. ConfigureDataGeneratorForStream will configure a data generator for the stream
+        /// </summary>
+        /// <param name="streamId"></param>
+        internal void ConfigureDataGeneratorForStream(IStreamIdentity streamId)
+        {
+            (this.receiver as EventHubPartitionGeneratorReceiver)?.ConfigureDataGeneratorForStream(streamId);
+        }
+
+        internal void StopProducingOnStream(IStreamIdentity streamId)
+        {
+            (this.receiver as EventHubPartitionGeneratorReceiver)?.StopProducingOnStream(streamId);
+        }
+#endregion
 
         private class StreamActivityNotificationBatch : IBatchContainer
         {
@@ -303,7 +372,7 @@ namespace Orleans.ServiceBus.Providers
                 return true;
             }
 
-            public void Refresh()
+            public void Refresh(StreamSequenceToken token)
             {
             }
 

@@ -19,15 +19,15 @@
     <tags>Orleans Cloud-Computing Actor-Model Actors Distributed-Systems C# .NET</tags>
     <dependencies>
       <dependency id="Microsoft.Orleans.Core" version="$version$" />      
-	  <dependency id="Newtonsoft.Json" version="7.0.1" />
+	  <dependency id="Newtonsoft.Json" version="9.0.1" />
     </dependencies>
   </metadata>
   <files>
-    <file src="OrleansSqlUtils.dll" target="lib\net451" />
-    <file src="OrleansSqlUtils.pdb" target="lib\net451" />
-    <file src="OrleansSqlUtils.xml" target="lib\net451" />
-    <file src="CreateOrleansTables_SqlServer.sql" target="lib\net451\SQLServer" />
-    <file src="CreateOrleansTables_MySql.sql" target="lib\net451\MySql" />
-    <file src="CreateOrleansTables_PostgreSql.sql" target="lib\net451\PostgreSql" />
+    <file src="OrleansSqlUtils.dll" target="lib\net461" />
+    <file src="OrleansSqlUtils.pdb" target="lib\net461" />
+    <file src="OrleansSqlUtils.xml" target="lib\net461" />
+    <file src="CreateOrleansTables_SqlServer.sql" target="lib\net461\SQLServer" />
+    <file src="CreateOrleansTables_MySql.sql" target="lib\net461\MySql" />
+    <file src="CreateOrleansTables_PostgreSql.sql" target="lib\net461\PostgreSql" />
   </files>
 </package>

@@ -1,34 +1,50 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Net;
+#if NETSTANDARD
+using System.Reflection;
+#endif
 using System.Runtime;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
-
+using Orleans.CodeGeneration;
+using Orleans.Core;
 using Orleans.GrainDirectory;
+using Orleans.LogConsistency;
 using Orleans.Providers;
 using Orleans.Runtime.Configuration;
 using Orleans.Runtime.ConsistentRing;
 using Orleans.Runtime.Counters;
 using Orleans.Runtime.GrainDirectory;
+using Orleans.Runtime.LogConsistency;
 using Orleans.Runtime.MembershipService;
 using Orleans.Runtime.Messaging;
 using Orleans.Runtime.MultiClusterNetwork;
 using Orleans.Runtime.Placement;
 using Orleans.Runtime.Providers;
+using Orleans.Runtime.ReminderService;
 using Orleans.Runtime.Scheduler;
 using Orleans.Runtime.Startup;
 using Orleans.Runtime.Storage;
 using Orleans.Runtime.TestHooks;
+using Orleans.Runtime.Utilities;
 using Orleans.Serialization;
+using Orleans.Services;
 using Orleans.Storage;
 using Orleans.Streams;
 using Orleans.Timers;
+using Orleans.MultiCluster;
+using Orleans.Runtime.Versions;
+using Orleans.Runtime.Versions.Compatibility;
+using Orleans.Streams.Core;
+using Orleans.Versions.Compatibility;
+using Orleans.Runtime.Versions.Selector;
+using Orleans.Versions.Selector;
 
 namespace Orleans.Runtime
 {
@@ -60,19 +76,20 @@ namespace Orleans.Runtime
         private readonly IncomingMessageAgent incomingSystemAgent;
         private readonly IncomingMessageAgent incomingPingAgent;
         private readonly Logger logger;
-        private readonly GrainTypeManager typeManager;
+        private readonly GrainTypeManager grainTypeManager;
+        private TypeManager typeManager;
         private readonly ManualResetEvent siloTerminatedEvent;
         private readonly SiloStatisticsManager siloStatistics;
-        private readonly MembershipFactory membershipFactory;
         private readonly InsideRuntimeClient runtimeClient;
         private readonly AssemblyProcessor assemblyProcessor;
         private StorageProviderManager storageProviderManager;
+        private LogConsistencyProviderManager logConsistencyProviderManager;
         private StatisticsProviderManager statisticsProviderManager;
         private BootstrapProviderManager bootstrapProviderManager;
         private IReminderService reminderService;
         private ProviderManagerSystemTarget providerManagerSystemTarget;
         private readonly IMembershipOracle membershipOracle;
-        private IMultiClusterOracle multiClusterOracle;
+        private readonly IMultiClusterOracle multiClusterOracle;
 
         private Watchdog platformWatchdog;
         private readonly TimeSpan initTimeout;
@@ -83,7 +100,7 @@ namespace Orleans.Runtime
         private readonly GrainFactory grainFactory;
         private readonly IGrainRuntime grainRuntime;
         private readonly List<IProvider> allSiloProviders = new List<IProvider>();
-        
+
         /// <summary>
         /// Gets the type of this 
         /// </summary>
@@ -93,29 +110,25 @@ namespace Orleans.Runtime
         internal GlobalConfiguration GlobalConfig => this.initializationParams.GlobalConfig;
         internal NodeConfiguration LocalConfig => this.initializationParams.NodeConfig;
         internal OrleansTaskScheduler LocalScheduler { get { return scheduler; } }
+        internal GrainTypeManager LocalGrainTypeManager { get { return grainTypeManager; } }
         internal ILocalGrainDirectory LocalGrainDirectory { get { return localGrainDirectory; } }
-        internal ISiloStatusOracle LocalSiloStatusOracle { get { return membershipOracle; } }
         internal IMultiClusterOracle LocalMultiClusterOracle { get { return multiClusterOracle; } }
         internal IConsistentRingProvider RingProvider { get; private set; }
+        internal ILogConsistencyProviderManager LogConsistencyProviderManager { get { return logConsistencyProviderManager; } }
         internal IStorageProviderManager StorageProviderManager { get { return storageProviderManager; } }
         internal IProviderManager StatisticsProviderManager { get { return statisticsProviderManager; } }
         internal IStreamProviderManager StreamProviderManager { get { return grainRuntime.StreamProviderManager; } }
         internal IList<IBootstrapProvider> BootstrapProviders { get; private set; }
         internal ISiloPerformanceMetrics Metrics { get { return siloStatistics.MetricsTable; } }
-        internal static Silo CurrentSilo { get; private set; }
         internal IReadOnlyCollection<IProvider> AllSiloProviders 
         {
             get { return allSiloProviders.AsReadOnly();  }
         }
         internal ICatalog Catalog => catalog;
 
-        internal IServiceProvider Services { get; }
+        internal SystemStatus SystemStatus { get; set; }
 
-        /// <summary> Get the id of the cluster this silo is part of. </summary>
-        public string ClusterId
-        {
-            get { return GlobalConfig.HasMultiClusterNetwork ? GlobalConfig.ClusterId : null; } 
-        }
+        internal IServiceProvider Services { get; }
 
         /// <summary> SiloAddress for this silo. </summary>
         public SiloAddress SiloAddress => this.initializationParams.SiloAddress;
@@ -155,10 +168,9 @@ namespace Orleans.Runtime
             ClusterConfiguration config = initializationParams.ClusterConfig;
             this.initializationParams = initializationParams;
 
-            SystemStatus.Current = SystemStatus.Creating;
-
-            CurrentSilo = this;
-
+            this.SystemStatus = SystemStatus.Creating;
+            AsynchAgent.IsStarting = true;
+            
             var startTime = DateTime.UtcNow;
             
             siloTerminatedEvent = new ManualResetEvent(false);
@@ -167,10 +179,8 @@ namespace Orleans.Runtime
                 LogManager.Initialize(LocalConfig);
 
             config.OnConfigChange("Defaults/Tracing", () => LogManager.Initialize(LocalConfig, true), false);
-            MultiClusterRegistrationStrategy.Initialize(config.Globals);
             StatisticsCollector.Initialize(LocalConfig);
             
-            SerializationManager.Initialize(GlobalConfig.SerializationProviders, this.GlobalConfig.FallbackSerializationProvider);
             initTimeout = GlobalConfig.MaxJoinAttemptTime;
             if (Debugger.IsAttached)
             {
@@ -193,105 +203,129 @@ namespace Orleans.Runtime
                 this.initializationParams.Type, LocalConfig.DNSHostName, Environment.MachineName, localEndpoint, this.initializationParams.SiloAddress.Generation);
             logger.Info(ErrorCode.SiloInitConfig, "Starting silo {0} with the following configuration= " + Environment.NewLine + "{1}",
                 name, config.ToString(name));
-            
+
+            // Register system services.
+            var services = new ServiceCollection();
+            services.AddSingleton(this);
+            services.AddSingleton(initializationParams);
+            services.AddFromExisting<ILocalSiloDetails, SiloInitializationParameters>();
+            services.AddSingleton(initializationParams.ClusterConfig);
+            services.AddSingleton(initializationParams.GlobalConfig);
+            services.AddTransient(sp => initializationParams.NodeConfig);
+            services.AddTransient<Func<NodeConfiguration>>(sp => () => initializationParams.NodeConfig);
+            services.AddTransient(typeof(IStreamSubscriptionObserver<>),typeof(StreamSubscriptionObserverProxy<>));
+            services.AddFromExisting<IMessagingConfiguration, GlobalConfiguration>();
+            services.AddFromExisting<ITraceConfiguration, NodeConfiguration>();
+            services.AddSingleton<SerializationManager>();
+            services.AddSingleton<ITimerRegistry, TimerRegistry>();
+            services.AddSingleton<IReminderRegistry, ReminderRegistry>();
+            services.AddSingleton<IStreamProviderManager, StreamProviderManager>();
+            services.AddSingleton<GrainRuntime>();
+            services.AddSingleton<IGrainRuntime, GrainRuntime>();
+            services.AddSingleton<OrleansTaskScheduler>();
+            services.AddSingleton<GrainFactory>(sp => sp.GetService<InsideRuntimeClient>().ConcreteGrainFactory);
+            services.AddFromExisting<IGrainFactory, GrainFactory>();
+            services.AddFromExisting<IInternalGrainFactory, GrainFactory>();
+            services.AddFromExisting<IGrainReferenceConverter, GrainFactory>();
+            services.AddSingleton<TypeMetadataCache>();
+            services.AddSingleton<AssemblyProcessor>();
+            services.AddSingleton<ActivationDirectory>();
+            services.AddSingleton<LocalGrainDirectory>();
+            services.AddFromExisting<ILocalGrainDirectory, LocalGrainDirectory>();
+            services.AddSingleton(sp => sp.GetRequiredService<LocalGrainDirectory>().GsiActivationMaintainer);
+            services.AddSingleton<SiloStatisticsManager>();
+            services.AddSingleton<ISiloPerformanceMetrics>(sp => sp.GetRequiredService<SiloStatisticsManager>().MetricsTable);
+            services.AddFromExisting<ICorePerformanceMetrics, ISiloPerformanceMetrics>();
+            services.AddSingleton<SiloAssemblyLoader>();
+            services.AddSingleton<GrainTypeManager>();
+            services.AddFromExisting<IMessagingConfiguration, GlobalConfiguration>();
+            services.AddSingleton<MessageCenter>();
+            services.AddFromExisting<IMessageCenter, MessageCenter>();
+            services.AddFromExisting<ISiloMessageCenter, MessageCenter>();
+            services.AddSingleton(FactoryUtility.Create<MessageCenter, Gateway>);
+            services.AddSingleton<Catalog>();
+            services.AddSingleton<Dispatcher>(sp => sp.GetRequiredService<Catalog>().Dispatcher);
+            services.AddSingleton<InsideRuntimeClient>();
+            services.AddFromExisting<IRuntimeClient, InsideRuntimeClient>();
+            services.AddFromExisting<ISiloRuntimeClient, InsideRuntimeClient>();
+            services.AddSingleton<MultiClusterGossipChannelFactory>();
+            services.AddSingleton<MultiClusterOracle>();
+            services.AddSingleton<MultiClusterRegistrationStrategyManager>();
+            services.AddFromExisting<IMultiClusterOracle, MultiClusterOracle>();
+            services.AddSingleton<DeploymentLoadPublisher>();
+            services.AddSingleton<MembershipOracle>();
+            services.AddFromExisting<IMembershipOracle, MembershipOracle>();
+            services.AddFromExisting<ISiloStatusOracle, MembershipOracle>();
+            services.AddSingleton<MembershipTableFactory>();
+            services.AddSingleton<ReminderTableFactory>();
+            services.AddSingleton<IReminderTable>(sp => sp.GetRequiredService<ReminderTableFactory>().Create());
+            services.AddSingleton<LocalReminderServiceFactory>();
+            services.AddSingleton<ClientObserverRegistrar>();
+            services.AddSingleton<SiloProviderRuntime>();
+            services.AddFromExisting<IStreamProviderRuntime, SiloProviderRuntime>();
+            services.AddSingleton<ImplicitStreamSubscriberTable>();
+            services.AddSingleton<MessageFactory>();
+            services.AddSingleton<Factory<string, Logger>>(LogManager.GetLogger);
+            services.AddSingleton<CodeGeneratorManager>();
+
+            services.AddSingleton<IGrainRegistrar<GlobalSingleInstanceRegistration>, GlobalSingleInstanceRegistrar>();
+            services.AddSingleton<IGrainRegistrar<ClusterLocalRegistration>, ClusterLocalRegistrar>();
+            services.AddSingleton<RegistrarManager>();
+            services.AddSingleton(FactoryUtility.Create<Grain, IMultiClusterRegistrationStrategy, ProtocolServices>);
+            services.AddSingleton(FactoryUtility.Create<GrainDirectoryPartition>);
+
+            // Placement
+            services.AddSingleton<PlacementDirectorsManager>();
+            services.AddSingleton<IPlacementDirector<RandomPlacement>, RandomPlacementDirector>();
+            services.AddSingleton<IActivationSelector<RandomPlacement>, RandomPlacementDirector>();
+            services.AddSingleton<IPlacementDirector<PreferLocalPlacement>, PreferLocalPlacementDirector>();
+            services.AddSingleton<IPlacementDirector<StatelessWorkerPlacement>, StatelessWorkerDirector>();
+            services.AddSingleton<IActivationSelector<StatelessWorkerPlacement>, StatelessWorkerDirector>();
+            services.AddSingleton<IPlacementDirector<ActivationCountBasedPlacement>, ActivationCountPlacementDirector>();
+            services.AddSingleton<IPlacementDirector<HashBasedPlacement>, HashBasedPlacementDirector>();
+            services.AddSingleton<DefaultPlacementStrategy>();
+            services.AddSingleton<ClientObserversPlacementDirector>();
+
+            // Versions
+            services.AddSingleton<VersionSelectorManager>();
+            services.AddSingleton<IVersionSelector<MinimumVersion>, MinimumVersionSelector>();
+            services.AddSingleton<IVersionSelector<LatestVersion>, LatestVersionSelector>();
+            services.AddSingleton<IVersionSelector<AllCompatibleVersions>, AllCompatibleVersionsSelector>();
+            services.AddSingleton<CompatibilityDirectorManager>();
+            services.AddSingleton<ICompatibilityDirector<BackwardCompatible>, BackwardCompatilityDirector>();
+            services.AddSingleton<ICompatibilityDirector<AllVersionsCompatible>, AllVersionsCompatibilityDirector>();
+            services.AddSingleton<CachedVersionSelectorManager>();
+
+            services.AddSingleton<Func<IGrainRuntime>>(sp => () => sp.GetRequiredService<IGrainRuntime>());
+            services.AddSingleton<GrainCreator>();
+            services.AddSingleton<IStreamSubscriptionManagerAdmin>(sp => new StreamSubscriptionManagerAdmin(sp.GetRequiredService<IStreamProviderRuntime>()));
+            if (initializationParams.GlobalConfig.UseVirtualBucketsConsistentRing)
+            {
+                services.AddSingleton<IConsistentRingProvider>(
+                    sp =>
+                    new VirtualBucketsRingProvider(
+                        this.initializationParams.SiloAddress,
+                        this.initializationParams.GlobalConfig.NumVirtualBucketsConsistentRing));
+            }
+            else
+            {
+                services.AddSingleton<IConsistentRingProvider>(
+                    sp => new ConsistentRingProvider(this.initializationParams.SiloAddress));
+            }
+
             // Configure DI using Startup type
-            this.Services = StartupBuilder.ConfigureStartup(
-                this.LocalConfig.StartupTypeName,
-                (services, usingCustomServiceProvider) =>
-                {
-                    // add system types
-                    // Note: you can replace IGrainFactory with your own implementation, but 
-                    // we don't recommend it, in the aspect of performance and usability
-                    services.TryAddSingleton(sp => sp);
-                    services.TryAddSingleton(this);
-                    services.TryAddSingleton(initializationParams);
-                    services.TryAddSingleton<ILocalSiloDetails>(initializationParams);
-                    services.TryAddSingleton(initializationParams.ClusterConfig);
-                    services.TryAddSingleton(initializationParams.GlobalConfig);
-                    services.TryAddTransient(sp => initializationParams.NodeConfig);
-                    services.TryAddSingleton<ITimerRegistry, TimerRegistry>();
-                    services.TryAddSingleton<IReminderRegistry, ReminderRegistry>();
-                    services.TryAddSingleton<IStreamProviderManager, StreamProviderManager>();
-                    services.TryAddSingleton<GrainRuntime>();
-                    services.TryAddSingleton<IGrainRuntime, GrainRuntime>();
-                    services.TryAddSingleton<OrleansTaskScheduler>();
-                    services.TryAddSingleton<GrainFactory>(sp => sp.GetService<InsideRuntimeClient>().ConcreteGrainFactory);
-                    services.TryAddExisting<IGrainFactory, GrainFactory>();
-                    services.TryAddExisting<IInternalGrainFactory, GrainFactory>();
-                    services.TryAddSingleton<TypeMetadataCache>();
-                    services.TryAddSingleton<AssemblyProcessor>();
-                    services.TryAddSingleton<ActivationDirectory>();
-                    services.TryAddSingleton<LocalGrainDirectory>();
-                    services.TryAddExisting<ILocalGrainDirectory, LocalGrainDirectory>();
-                    services.TryAddSingleton<SiloStatisticsManager>();
-                    services.TryAddSingleton<ISiloPerformanceMetrics>(sp => sp.GetRequiredService<SiloStatisticsManager>().MetricsTable);
-                    services.TryAddSingleton<SiloAssemblyLoader>();
-                    services.TryAddSingleton<GrainTypeManager>();
-                    services.TryAddExisting<IMessagingConfiguration, GlobalConfiguration>();
-                    services.TryAddSingleton<MessageCenter>();
-                    services.TryAddExisting<IMessageCenter, MessageCenter>();
-                    services.TryAddExisting<ISiloMessageCenter, MessageCenter>();
-                    services.TryAddSingleton<Catalog>();
-                    services.TryAddSingleton(sp => sp.GetRequiredService<Catalog>().Dispatcher);
-                    services.TryAddSingleton<InsideRuntimeClient>();
-                    services.TryAddExisting<IRuntimeClient, InsideRuntimeClient>();
-                    services.TryAddSingleton<MembershipFactory>();
-                    services.TryAddSingleton<MultiClusterOracleFactory>();
-                    services.TryAddSingleton<LocalReminderServiceFactory>();
-                    services.TryAddSingleton<DeploymentLoadPublisher>();
-                    services.TryAddSingleton<IMembershipTable>(
-                        sp => sp.GetRequiredService<MembershipFactory>().GetMembershipTable(sp.GetRequiredService<GlobalConfiguration>()));
-                    services.TryAddSingleton<MembershipOracle>(
-                        sp =>
-                        sp.GetRequiredService<MembershipFactory>()
-                          .CreateMembershipOracle(sp.GetRequiredService<Silo>(), sp.GetRequiredService<IMembershipTable>()));
-                    services.TryAddExisting<IMembershipOracle, MembershipOracle>();
-                    services.TryAddExisting<ISiloStatusOracle, MembershipOracle>();
-                    services.TryAddSingleton<Func<ISiloStatusOracle>>(sp => () => sp.GetRequiredService<ISiloStatusOracle>());
-                    services.TryAddSingleton<MultiClusterOracleFactory>();
-                    services.TryAddSingleton<LocalReminderServiceFactory>();
-                    services.TryAddSingleton<ClientObserverRegistrar>();
-
-                    // Placement
-                    services.TryAddSingleton<PlacementDirectorsManager>();
-                    services.TryAddSingleton<IPlacementDirector<RandomPlacement>, RandomPlacementDirector>();
-                    services.TryAddSingleton<IPlacementDirector<PreferLocalPlacement>, PreferLocalPlacementDirector>();
-                    services.TryAddSingleton<IPlacementDirector<StatelessWorkerPlacement>, StatelessWorkerDirector>();
-                    services.TryAddSingleton<IPlacementDirector<ActivationCountBasedPlacement>, ActivationCountPlacementDirector>();
-                    services.TryAddSingleton<DefaultPlacementStrategy>();
-                    services.TryAddSingleton<ClientObserversPlacementDirector>();
-                    
-                    services.TryAddSingleton<Func<IGrainRuntime>>(sp => () => sp.GetRequiredService<IGrainRuntime>());
-                    if (usingCustomServiceProvider)
-                    {
-                        services.TryAddSingleton<GrainCreator>();
-                    }
-                    else
-                    {
-                        services.TryAddSingleton(sp => new GrainCreator(null, sp.GetRequiredService<Func<IGrainRuntime>>()));
-                    }
-
-                    if (initializationParams.GlobalConfig.UseVirtualBucketsConsistentRing)
-                    {
-                        services.TryAddSingleton<IConsistentRingProvider>(
-                            sp =>
-                            new VirtualBucketsRingProvider(
-                                this.initializationParams.SiloAddress,
-                                this.initializationParams.GlobalConfig.NumVirtualBucketsConsistentRing));
-                    }
-                    else
-                    {
-                        services.TryAddSingleton<IConsistentRingProvider>(
-                            sp => new ConsistentRingProvider(this.initializationParams.SiloAddress));
-                    }
-                });
+            this.Services = StartupBuilder.ConfigureStartup(this.LocalConfig.StartupTypeName, services);
 
             this.assemblyProcessor = this.Services.GetRequiredService<AssemblyProcessor>();
             this.assemblyProcessor.Initialize();
 
             BufferPool.InitGlobalBufferPool(GlobalConfig);
 
-            UnobservedExceptionsHandlerClass.SetUnobservedExceptionHandler(UnobservedExceptionHandler);
+            if (!UnobservedExceptionsHandlerClass.TrySetUnobservedExceptionHandler(UnobservedExceptionHandler))
+            {
+                logger.Warn(ErrorCode.Runtime_Error_100153, "Unable to set unobserved exception handler because it was already set.");
+            }
+
             AppDomain.CurrentDomain.UnhandledException += this.DomainUnobservedExceptionHandler;
 
             try
@@ -304,7 +338,7 @@ namespace Orleans.Runtime
                 throw;
             }
 
-            typeManager = Services.GetRequiredService<GrainTypeManager>();
+            grainTypeManager = Services.GetRequiredService<GrainTypeManager>();
 
             // Performance metrics
             siloStatistics = Services.GetRequiredService<SiloStatisticsManager>();
@@ -317,7 +351,8 @@ namespace Orleans.Runtime
 
             // Initialize the message center
             messageCenter = Services.GetRequiredService<MessageCenter>();
-            messageCenter.RerouteHandler = runtimeClient.RerouteMessage;
+            var dispatcher  = this.Services.GetRequiredService<Dispatcher>();
+            messageCenter.RerouteHandler = dispatcher.RerouteMessage;
             messageCenter.SniffIncomingMessage = runtimeClient.SniffIncomingMessage;
 
             // GrainRuntime can be created only here, after messageCenter was created.
@@ -333,24 +368,31 @@ namespace Orleans.Runtime
             // Now the consistent ring provider
             RingProvider = Services.GetRequiredService<IConsistentRingProvider>();
 
-            // to preserve backwards compatibility, only use the service provider to inject grain dependencies if the user supplied his own
-            // service provider, meaning that he is explicitly opting into it.
             catalog = Services.GetRequiredService<Catalog>();
-
             siloStatistics.MetricsTable.Scheduler = scheduler;
             siloStatistics.MetricsTable.ActivationDirectory = activationDirectory;
             siloStatistics.MetricsTable.ActivationCollector = catalog.ActivationCollector;
             siloStatistics.MetricsTable.MessageCenter = messageCenter;
-            
-            // Now the incoming message agents
-            incomingSystemAgent = new IncomingMessageAgent(Message.Categories.System, messageCenter, activationDirectory, scheduler, catalog.Dispatcher);
-            incomingPingAgent = new IncomingMessageAgent(Message.Categories.Ping, messageCenter, activationDirectory, scheduler, catalog.Dispatcher);
-            incomingAgent = new IncomingMessageAgent(Message.Categories.Application, messageCenter, activationDirectory, scheduler, catalog.Dispatcher);
 
-            membershipFactory = Services.GetRequiredService<MembershipFactory>();
+            // Now the incoming message agents
+            var messageFactory = this.Services.GetRequiredService<MessageFactory>();
+            incomingSystemAgent = new IncomingMessageAgent(Message.Categories.System, messageCenter, activationDirectory, scheduler, catalog.Dispatcher, messageFactory);
+            incomingPingAgent = new IncomingMessageAgent(Message.Categories.Ping, messageCenter, activationDirectory, scheduler, catalog.Dispatcher, messageFactory);
+            incomingAgent = new IncomingMessageAgent(Message.Categories.Application, messageCenter, activationDirectory, scheduler, catalog.Dispatcher, messageFactory);
+
             membershipOracle = Services.GetRequiredService<IMembershipOracle>();
 
-            SystemStatus.Current = SystemStatus.Created;
+            if (!this.GlobalConfig.HasMultiClusterNetwork)
+            {
+                logger.Info("Skip multicluster oracle creation (no multicluster network configured)");
+            }
+            else
+            {
+                multiClusterOracle = Services.GetRequiredService<IMultiClusterOracle>();
+            }
+
+            this.SystemStatus = SystemStatus.Created;
+            AsynchAgent.IsStarting = false;
 
             StringValueStatistic.FindOrCreate(StatisticNames.SILO_START_TIME,
                 () => LogFormatter.PrintDate(startTime)); // this will help troubleshoot production deployment when looking at MDS logs.
@@ -367,7 +409,11 @@ namespace Orleans.Runtime
             RegisterSystemTarget(siloControl);
 
             logger.Verbose("Creating {0} System Target", "StreamProviderUpdateAgent");
-            RegisterSystemTarget(new StreamProviderManagerAgent(this, allSiloProviders));
+            RegisterSystemTarget(
+                new StreamProviderManagerAgent(this, allSiloProviders, Services.GetRequiredService<IStreamProviderRuntime>()));
+
+            logger.Verbose("Creating {0} System Target", "ProtocolGateway");
+            RegisterSystemTarget(new ProtocolGateway(this.SiloAddress));
 
             logger.Verbose("Creating {0} System Target", "DeploymentLoadPublisher");
             RegisterSystemTarget(Services.GetRequiredService<DeploymentLoadPublisher>());
@@ -380,8 +426,12 @@ namespace Orleans.Runtime
             RegisterSystemTarget(LocalGrainDirectory.RemoteClusterGrainDirectory);
 
             logger.Verbose("Creating {0} System Target", "ClientObserverRegistrar + TypeManager");
+
             this.RegisterSystemTarget(this.Services.GetRequiredService<ClientObserverRegistrar>());
-            this.RegisterSystemTarget(new TypeManager(this.SiloAddress, this.typeManager));
+            var implicitStreamSubscriberTable = Services.GetRequiredService<ImplicitStreamSubscriberTable>();
+            var versionDirectorManager = this.Services.GetRequiredService<CachedVersionSelectorManager>();
+            typeManager = new TypeManager(SiloAddress, this.grainTypeManager, membershipOracle, LocalScheduler, GlobalConfig.TypeMapRefreshInterval, implicitStreamSubscriberTable, this.grainFactory, versionDirectorManager);
+            this.RegisterSystemTarget(typeManager);
 
             logger.Verbose("Creating {0} System Target", "MembershipOracle");
             if (this.membershipOracle is SystemTarget)
@@ -408,22 +458,27 @@ namespace Orleans.Runtime
         {
             healthCheckParticipants.Add(membershipOracle);
 
-            catalog.SiloStatusOracle = LocalSiloStatusOracle;
+            catalog.SiloStatusOracle = this.membershipOracle;
             localGrainDirectory.CatalogSiloStatusListener = catalog;
-            LocalSiloStatusOracle.SubscribeToSiloStatusEvents(localGrainDirectory);
-            messageCenter.SiloDeadOracle = LocalSiloStatusOracle.IsDeadSilo;
+            this.membershipOracle.SubscribeToSiloStatusEvents(localGrainDirectory);
+            messageCenter.SiloDeadOracle = this.membershipOracle.IsDeadSilo;
 
             // consistentRingProvider is not a system target per say, but it behaves like the localGrainDirectory, so it is here
-            LocalSiloStatusOracle.SubscribeToSiloStatusEvents((ISiloStatusListener)RingProvider);
+            this.membershipOracle.SubscribeToSiloStatusEvents((ISiloStatusListener)RingProvider);
 
-            LocalSiloStatusOracle.SubscribeToSiloStatusEvents(Services.GetRequiredService<DeploymentLoadPublisher>());
+            this.membershipOracle.SubscribeToSiloStatusEvents(typeManager);
+
+            this.membershipOracle.SubscribeToSiloStatusEvents(Services.GetRequiredService<DeploymentLoadPublisher>());
+
+            this.membershipOracle.SubscribeToSiloStatusEvents(Services.GetRequiredService<ClientObserverRegistrar>());
 
             if (!GlobalConfig.ReminderServiceType.Equals(GlobalConfiguration.ReminderServiceProviderType.Disabled))
             {
                 // start the reminder service system target
                 reminderService = Services.GetRequiredService<LocalReminderServiceFactory>()
-                                          .CreateReminderService(this, grainFactory, initTimeout);
-                RegisterSystemTarget((SystemTarget) reminderService);
+                                          .CreateReminderService(this, initTimeout, this.runtimeClient);
+                var reminderServiceSystemTarget = this.reminderService as SystemTarget;
+                if (reminderServiceSystemTarget != null) RegisterSystemTarget(reminderServiceSystemTarget);
             }
 
             RegisterSystemTarget(catalog);
@@ -434,13 +489,7 @@ namespace Orleans.Runtime
             providerManagerSystemTarget = new ProviderManagerSystemTarget(this);
             RegisterSystemTarget(providerManagerSystemTarget);
         }
-
-        private async Task CreateSystemGrains()
-        {
-            if (Type == SiloType.Primary)
-                await membershipFactory.CreateMembershipTableProvider(catalog, this).WithTimeout(initTimeout);
-        }
-
+        
         /// <summary> Perform silo startup operations. </summary>
         public void Start()
         {
@@ -459,10 +508,10 @@ namespace Orleans.Runtime
         {
             lock (lockable)
             {
-                if (!SystemStatus.Current.Equals(SystemStatus.Created))
-                    throw new InvalidOperationException(String.Format("Calling Silo.Start() on a silo which is not in the Created state. This silo is in the {0} state.", SystemStatus.Current));
+                if (!this.SystemStatus.Equals(SystemStatus.Created))
+                    throw new InvalidOperationException(String.Format("Calling Silo.Start() on a silo which is not in the Created state. This silo is in the {0} state.", this.SystemStatus));
                 
-                SystemStatus.Current = SystemStatus.Starting;
+                this.SystemStatus = SystemStatus.Starting;
             }
 
             logger.Info(ErrorCode.SiloStarting, "Silo Start()");
@@ -474,7 +523,7 @@ namespace Orleans.Runtime
             ConfigureThreadPoolAndServicePointSettings();
 
             // This has to start first so that the directory system target factory gets loaded before we start the router.
-            typeManager.Start();
+            grainTypeManager.Start();
             runtimeClient.Start();
 
             // The order of these 4 is pretty much arbitrary.
@@ -488,11 +537,14 @@ namespace Orleans.Runtime
 
             // Set up an execution context for this thread so that the target creation steps can use asynch values.
             RuntimeContext.InitializeMainThread();
+            
+            // Initialize the implicit stream subscribers table.
+            var implicitStreamSubscriberTable = Services.GetRequiredService<ImplicitStreamSubscriberTable>();
+            implicitStreamSubscriberTable.InitImplicitStreamSubscribers(this.grainTypeManager.GrainClassTypeData.Select(t => t.Value.Type).ToArray());
 
-            SiloProviderRuntime.Initialize(GlobalConfig, SiloAddress.ToLongString(), grainFactory, Services);
-            SiloProviderRuntime.Instance.StreamingInitialize();
-            runtimeClient.CurrentStreamProviderRuntime = SiloProviderRuntime.Instance;
-            statisticsProviderManager = new StatisticsProviderManager("Statistics", SiloProviderRuntime.Instance);
+            var siloProviderRuntime = Services.GetRequiredService<SiloProviderRuntime>();
+            runtimeClient.CurrentStreamProviderRuntime = siloProviderRuntime;
+            statisticsProviderManager = new StatisticsProviderManager(ProviderCategoryConfiguration.STATISTICS_PROVIDER_CATEGORY_NAME, siloProviderRuntime);
             string statsProviderName =  statisticsProviderManager.LoadProvider(GlobalConfig.ProviderConfigurations)
                 .WaitForResultWithThrow(initTimeout);
             if (statsProviderName != null)
@@ -503,10 +555,6 @@ namespace Orleans.Runtime
             siloStatistics.SetSiloStatsTableDataManager(this, LocalConfig).WaitWithThrow(initTimeout);
             siloStatistics.SetSiloMetricsTableDataManager(this, LocalConfig).WaitWithThrow(initTimeout);
 
-            IMembershipTable membershipTable = Services.GetRequiredService<IMembershipTable>();
-            
-            multiClusterOracle =
-                Services.GetRequiredService<MultiClusterOracleFactory>().CreateGossipOracle(this).WaitForResultWithThrow(initTimeout);
 
             // This has to follow the above steps that start the runtime components
             CreateSystemTargets();
@@ -515,14 +563,9 @@ namespace Orleans.Runtime
 
             // Validate the configuration.
             GlobalConfig.Application.ValidateConfiguration(logger);
-
-            // ensure this runs in the grain context, wait for it to complete
-            scheduler.QueueTask(CreateSystemGrains, catalog.SchedulingContext)
-                .WaitWithThrow(initTimeout);
-            if (logger.IsVerbose) {  logger.Verbose("System grains created successfully."); }
-
+            
             // Initialize storage providers once we have a basic silo runtime environment operating
-            storageProviderManager = new StorageProviderManager(grainFactory, Services);
+            storageProviderManager = new StorageProviderManager(grainFactory, Services, siloProviderRuntime);
             scheduler.QueueTask(
                 () => storageProviderManager.LoadStorageProviders(GlobalConfig.ProviderConfigurations),
                 providerManagerSystemTarget.SchedulingContext)
@@ -531,42 +574,44 @@ namespace Orleans.Runtime
             allSiloProviders.AddRange(storageProviderManager.GetProviders());
             if (logger.IsVerbose) { logger.Verbose("Storage provider manager created successfully."); }
 
+            // Initialize log consistency providers once we have a basic silo runtime environment operating
+            logConsistencyProviderManager = new LogConsistencyProviderManager(grainFactory, Services, siloProviderRuntime);
+            scheduler.QueueTask(
+                () => logConsistencyProviderManager.LoadLogConsistencyProviders(GlobalConfig.ProviderConfigurations),
+                providerManagerSystemTarget.SchedulingContext)
+                    .WaitWithThrow(initTimeout);
+            catalog.SetLogConsistencyManager(logConsistencyProviderManager);
+            if (logger.IsVerbose) { logger.Verbose("Log consistency provider manager created successfully."); }
+
             // Load and init stream providers before silo becomes active
             var siloStreamProviderManager = (StreamProviderManager)grainRuntime.StreamProviderManager;
             scheduler.QueueTask(
-                () => siloStreamProviderManager.LoadStreamProviders(GlobalConfig.ProviderConfigurations, SiloProviderRuntime.Instance),
+                () => siloStreamProviderManager.LoadStreamProviders(GlobalConfig.ProviderConfigurations, siloProviderRuntime),
                     providerManagerSystemTarget.SchedulingContext)
                         .WaitWithThrow(initTimeout);
             runtimeClient.CurrentStreamProviderManager = siloStreamProviderManager;
             allSiloProviders.AddRange(siloStreamProviderManager.GetProviders());
             if (logger.IsVerbose) { logger.Verbose("Stream provider manager created successfully."); }
 
-            ISchedulingContext statusOracleContext = ((SystemTarget)LocalSiloStatusOracle).SchedulingContext;
+            // Load and init grain services before silo becomes active.
+            CreateGrainServices(GlobalConfig.GrainServiceConfigurations);
 
-            bool waitForPrimaryToStart = GlobalConfig.PrimaryNodeIsRequired && Type != SiloType.Primary;
-            if (waitForPrimaryToStart) // only in MembershipTableGrain case.
-            {
-                scheduler.QueueTask(() => membershipFactory.WaitForTableToInit(membershipTable), statusOracleContext)
-                        .WaitWithThrow(initTimeout);
-            }
-            scheduler.QueueTask(() => membershipTable.InitializeMembershipTable(GlobalConfig, true, LogManager.GetLogger(membershipTable.GetType().Name)), statusOracleContext)
-                .WaitWithThrow(initTimeout);
-          
-            scheduler.QueueTask(() => LocalSiloStatusOracle.Start(), statusOracleContext)
+            ISchedulingContext statusOracleContext = (this.membershipOracle as SystemTarget)?.SchedulingContext;
+            scheduler.QueueTask(() => this.membershipOracle.Start(), statusOracleContext)
                 .WaitWithThrow(initTimeout);
             if (logger.IsVerbose) { logger.Verbose("Local silo status oracle created successfully."); }
-            scheduler.QueueTask(LocalSiloStatusOracle.BecomeActive, statusOracleContext)
+            scheduler.QueueTask(this.membershipOracle.BecomeActive, statusOracleContext)
                 .WaitWithThrow(initTimeout);
             if (logger.IsVerbose) { logger.Verbose("Local silo status oracle became active successfully."); }
 
             //if running in multi cluster scenario, start the MultiClusterNetwork Oracle
             if (GlobalConfig.HasMultiClusterNetwork) 
             {
-                logger.Info("Creating multicluster oracle with my ServiceId={0} and ClusterId={1}.",
+                logger.Info("Starting multicluster oracle with my ServiceId={0} and ClusterId={1}.",
                     GlobalConfig.ServiceId, GlobalConfig.ClusterId);
 
-                ISchedulingContext clusterStatusContext = ((SystemTarget) multiClusterOracle).SchedulingContext;
-                scheduler.QueueTask(() => multiClusterOracle.Start(LocalSiloStatusOracle), clusterStatusContext)
+                ISchedulingContext clusterStatusContext = (multiClusterOracle as SystemTarget)?.SchedulingContext;
+                scheduler.QueueTask(() => multiClusterOracle.Start(), clusterStatusContext)
                                     .WaitWithThrow(initTimeout);
                 if (logger.IsVerbose) { logger.Verbose("multicluster oracle created successfully."); }
             }
@@ -590,7 +635,7 @@ namespace Orleans.Runtime
                 if (this.reminderService != null)
                 {
                     // so, we have the view of the membership in the consistentRingProvider. We can start the reminder service
-                    this.scheduler.QueueTask(this.reminderService.Start, ((SystemTarget)this.reminderService).SchedulingContext)
+                    this.scheduler.QueueTask(this.reminderService.Start, (this.reminderService as SystemTarget)?.SchedulingContext)
                         .WaitWithThrow(this.initTimeout);
                     if (this.logger.IsVerbose)
                     {
@@ -600,7 +645,7 @@ namespace Orleans.Runtime
 
                 this.bootstrapProviderManager = new BootstrapProviderManager();
                 this.scheduler.QueueTask(
-                    () => this.bootstrapProviderManager.LoadAppBootstrapProviders(this.GlobalConfig.ProviderConfigurations),
+                    () => this.bootstrapProviderManager.LoadAppBootstrapProviders(siloProviderRuntime, this.GlobalConfig.ProviderConfigurations),
                     this.providerManagerSystemTarget.SchedulingContext)
                         .WaitWithThrow(this.initTimeout);
                 this.BootstrapProviders = this.bootstrapProviderManager.GetProviders(); // Data hook for testing & diagnotics
@@ -619,7 +664,7 @@ namespace Orleans.Runtime
                 mc?.StartGateway(this.Services.GetRequiredService<ClientObserverRegistrar>());
                 if (this.logger.IsVerbose) { this.logger.Verbose("Message gateway service started successfully."); }
 
-                SystemStatus.Current = SystemStatus.Running;
+                this.SystemStatus = SystemStatus.Running;
             }
             catch (Exception exc)
             {
@@ -627,7 +672,38 @@ namespace Orleans.Runtime
                 this.FastKill(); // if failed after Membership became active, mark itself as dead in Membership abale.
                 throw;
             }
-            if (logger.IsVerbose) { logger.Verbose("Silo.Start complete: System status = {0}", SystemStatus.Current); }
+            if (logger.IsVerbose) { logger.Verbose("Silo.Start complete: System status = {0}", this.SystemStatus); }
+        }
+
+        private void CreateGrainServices(GrainServiceConfigurations grainServiceConfigurations)
+        {
+            foreach (var serviceConfig in grainServiceConfigurations.GrainServices)
+            {
+                // Construct the Grain Service
+                var serviceType = System.Type.GetType(serviceConfig.Value.ServiceType);
+                if (serviceType == null)
+                {
+                    throw new Exception(String.Format("Cannot find Grain Service type {0} of Grain Service {1}", serviceConfig.Value.ServiceType, serviceConfig.Value.Name));
+                }
+                
+                var grainServiceInterfaceType = serviceType.GetInterfaces().FirstOrDefault(x => x.GetInterfaces().Contains(typeof(IGrainService)));
+                if (grainServiceInterfaceType == null)
+                {
+                    throw new Exception(String.Format("Cannot find an interface on {0} which implements IGrainService", serviceConfig.Value.ServiceType));
+                }
+
+                var typeCode = GrainInterfaceUtils.GetGrainClassTypeCode(grainServiceInterfaceType);
+                var grainId = (IGrainIdentity)GrainId.GetGrainServiceGrainId(0, typeCode);
+                var grainService = (GrainService)ActivatorUtilities.CreateInstance(this.Services, serviceType, grainId, serviceConfig.Value);
+                RegisterSystemTarget(grainService);
+
+                this.scheduler.QueueTask(() => grainService.Init(Services), grainService.SchedulingContext).WaitWithThrow(this.initTimeout);
+                this.scheduler.QueueTask(grainService.Start, grainService.SchedulingContext).WaitWithThrow(this.initTimeout);
+                if (this.logger.IsVerbose)
+                {
+                    this.logger.Verbose(String.Format("{0} Grain Service started successfully.", serviceConfig.Value.Name));
+                }
+            }
         }
 
         /// <summary>
@@ -713,23 +789,23 @@ namespace Orleans.Runtime
             bool stopAlreadyInProgress = false;
             lock (lockable)
             {
-                if (SystemStatus.Current.Equals(SystemStatus.Stopping) || 
-                    SystemStatus.Current.Equals(SystemStatus.ShuttingDown) || 
-                    SystemStatus.Current.Equals(SystemStatus.Terminated))
+                if (this.SystemStatus.Equals(SystemStatus.Stopping) || 
+                    this.SystemStatus.Equals(SystemStatus.ShuttingDown) || 
+                    this.SystemStatus.Equals(SystemStatus.Terminated))
                 {
                     stopAlreadyInProgress = true;
                     // Drop through to wait below
                 }
-                else if (!SystemStatus.Current.Equals(SystemStatus.Running))
+                else if (!this.SystemStatus.Equals(SystemStatus.Running))
                 {
-                    throw new InvalidOperationException(String.Format("Calling Silo.{0} on a silo which is not in the Running state. This silo is in the {1} state.", operation, SystemStatus.Current));
+                    throw new InvalidOperationException(String.Format("Calling Silo.{0} on a silo which is not in the Running state. This silo is in the {1} state.", operation, this.SystemStatus));
                 }
                 else
                 {
                     if (gracefully)
-                        SystemStatus.Current = SystemStatus.ShuttingDown;
+                        this.SystemStatus = SystemStatus.ShuttingDown;
                     else
-                        SystemStatus.Current = SystemStatus.Stopping;
+                        this.SystemStatus = SystemStatus.Stopping;
                 }
             }
 
@@ -737,7 +813,7 @@ namespace Orleans.Runtime
             {
                 logger.Info(ErrorCode.SiloStopInProgress, "Silo termination is in progress - Will wait for it to finish");
                 var pause = TimeSpan.FromSeconds(1);
-                while (!SystemStatus.Current.Equals(SystemStatus.Terminated))
+                while (!this.SystemStatus.Equals(SystemStatus.Terminated))
                 {
                     logger.Info(ErrorCode.WaitingForSiloStop, "Waiting {0} for termination to complete", pause);
                     Thread.Sleep(pause);
@@ -753,27 +829,27 @@ namespace Orleans.Runtime
                     {
                         logger.Info(ErrorCode.SiloShuttingDown, "Silo starting to Shutdown()");
                         // 1: Write "ShutDown" state in the table + broadcast gossip msgs to re-read the table to everyone
-                        scheduler.QueueTask(LocalSiloStatusOracle.ShutDown, ((SystemTarget)LocalSiloStatusOracle).SchedulingContext)
+                        scheduler.QueueTask(this.membershipOracle.ShutDown, (this.membershipOracle as SystemTarget)?.SchedulingContext)
                             .WaitWithThrow(stopTimeout);
                     }
                     else
                     {
                         logger.Info(ErrorCode.SiloStopping, "Silo starting to Stop()");
                         // 1: Write "Stopping" state in the table + broadcast gossip msgs to re-read the table to everyone
-                        scheduler.QueueTask(LocalSiloStatusOracle.Stop, ((SystemTarget)LocalSiloStatusOracle).SchedulingContext)
+                        scheduler.QueueTask(this.membershipOracle.Stop, (this.membershipOracle as SystemTarget)?.SchedulingContext)
                             .WaitWithThrow(stopTimeout);
                     }
                 }
                 catch (Exception exc)
                 {
-                    logger.Error(ErrorCode.SiloFailedToStopMembership, String.Format("Failed to {0} LocalSiloStatusOracle. About to FastKill this silo.", operation), exc);
+                    logger.Error(ErrorCode.SiloFailedToStopMembership, String.Format("Failed to {0} membership oracle. About to FastKill this silo.", operation), exc);
                     return; // will go to finally
                 }
 
                 if (reminderService != null)
                 {
                     // 2: Stop reminder service
-                    scheduler.QueueTask(reminderService.Stop, ((SystemTarget) reminderService).SchedulingContext)
+                    scheduler.QueueTask(reminderService.Stop, (reminderService as SystemTarget)?.SchedulingContext)
                         .WaitWithThrow(stopTimeout);
                 }
 
@@ -845,7 +921,7 @@ namespace Orleans.Runtime
             if (!GlobalConfig.LivenessType.Equals(GlobalConfiguration.LivenessProviderType.MembershipTableGrain))
             {
                 // do not execute KillMyself if using MembershipTableGrain, since it will fail, as we've already stopped app scheduler turns.
-                SafeExecute(() => scheduler.QueueTask( LocalSiloStatusOracle.KillMyself, ((SystemTarget)LocalSiloStatusOracle).SchedulingContext)
+                SafeExecute(() => scheduler.QueueTask( this.membershipOracle.KillMyself, (this.membershipOracle as SystemTarget)?.SchedulingContext)
                     .WaitWithThrow(stopTimeout));
             }
 
@@ -864,14 +940,14 @@ namespace Orleans.Runtime
             SafeExecute(activationDirectory.PrintActivationDirectory);
             SafeExecute(messageCenter.Stop);
             SafeExecute(siloStatistics.Stop);
-            SafeExecute(GrainTypeManager.Stop);
 
             UnobservedExceptionsHandlerClass.ResetUnobservedExceptionHandler();
 
-            SafeExecute(() => SystemStatus.Current = SystemStatus.Terminated);
-            SafeExecute(LogManager.Close);
+            SafeExecute(() => this.SystemStatus = SystemStatus.Terminated);
             SafeExecute(() => AppDomain.CurrentDomain.UnhandledException -= this.DomainUnobservedExceptionHandler);
             SafeExecute(() => this.assemblyProcessor?.Dispose());
+            SafeExecute(() => (this.Services as IDisposable)?.Dispose());
+            SafeExecute(LogManager.Close);
 
             // Setting the event should be the last thing we do.
             // Do nothijng after that!
@@ -893,9 +969,9 @@ namespace Orleans.Runtime
             {
                 lock (lockable)
                 {
-                    if (!SystemStatus.Current.Equals(SystemStatus.Running)) return;
+                    if (!this.SystemStatus.Equals(SystemStatus.Running)) return;
                     
-                    SystemStatus.Current = SystemStatus.Stopping;
+                    this.SystemStatus = SystemStatus.Stopping;
                 }
                 
                 logger.Info(ErrorCode.SiloStopping, "Silo.HandleProcessExit() - starting to FastKill()");
@@ -935,14 +1011,8 @@ namespace Orleans.Runtime
 
         internal void RegisterSystemTarget(SystemTarget target)
         {
-            scheduler.RegisterWorkContext(target.SchedulingContext);
-            activationDirectory.RecordNewSystemTarget(target);
-        }
-
-        internal void UnregisterSystemTarget(SystemTarget target)
-        {
-            activationDirectory.RemoveSystemTarget(target);
-            scheduler.UnregisterWorkContext(target.SchedulingContext);
+            var providerRuntime = this.Services.GetRequiredService<SiloProviderRuntime>();
+            providerRuntime.RegisterSystemTarget(target);
         }
 
         /// <summary> Return dump of diagnostic data from this silo. </summary>
@@ -951,8 +1021,8 @@ namespace Orleans.Runtime
         public string GetDebugDump(bool all = true)
         {
             var sb = new StringBuilder();            
-            foreach (var sytemTarget in activationDirectory.AllSystemTargets())
-                sb.AppendFormat("System target {0}:", sytemTarget.GrainId.ToString()).AppendLine();               
+            foreach (var systemTarget in activationDirectory.AllSystemTargets())
+                sb.AppendFormat("System target {0}:", ((ISystemTargetBase)systemTarget).GrainId.ToString()).AppendLine();               
             
             var enumerator = activationDirectory.GetEnumerator();
             while(enumerator.MoveNext())
@@ -960,7 +1030,7 @@ namespace Orleans.Runtime
                 Utils.SafeExecute(() =>
                 {
                     var activationData = enumerator.Current.Value;
-                    var workItemGroup = scheduler.GetWorkItemGroup(new SchedulingContext(activationData));
+                    var workItemGroup = scheduler.GetWorkItemGroup(activationData.SchedulingContext);
                     if (workItemGroup == null)
                     {
                         sb.AppendFormat("Activation with no work item group!! Grain {0}, activation {1}.",

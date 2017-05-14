@@ -18,7 +18,9 @@ namespace Orleans.Runtime
         public const string ADO_INVARIANT_NAME = "AdoInvariant";
         public const string DATA_CONNECTION_FOR_REMINDERS_STRING_NAME = "DataConnectionStringForReminders";
         public const string ADO_INVARIANT_FOR_REMINDERS_NAME = "AdoInvariantForReminders";
-        
+
+        public const string DEFAULT_LOG_CONSISTENCY_PROVIDER_NAME = "Default";
+
         public const string ORLEANS_AZURE_UTILS_DLL = "OrleansAzureUtils";
 
         public const string ORLEANS_SQL_UTILS_DLL = "OrleansSQLUtils";
@@ -34,7 +36,6 @@ namespace Orleans.Runtime
         public static readonly GrainId ClientObserverRegistrarId = GrainId.GetSystemTargetGrainId(13);
         public static readonly GrainId CatalogId = GrainId.GetSystemTargetGrainId(14);
         public static readonly GrainId MembershipOracleId = GrainId.GetSystemTargetGrainId(15);
-        public static readonly GrainId ReminderServiceId = GrainId.GetSystemTargetGrainId(16);
         public static readonly GrainId TypeManagerId = GrainId.GetSystemTargetGrainId(17);
         public static readonly GrainId ProviderManagerSystemTargetId = GrainId.GetSystemTargetGrainId(19);
         public static readonly GrainId DeploymentLoadPublisherSystemTargetId = GrainId.GetSystemTargetGrainId(22);
@@ -42,6 +43,7 @@ namespace Orleans.Runtime
         public static readonly GrainId ClusterDirectoryServiceId = GrainId.GetSystemTargetGrainId(24);
         public static readonly GrainId StreamProviderManagerAgentSystemTargetId = GrainId.GetSystemTargetGrainId(25);
         public static readonly GrainId TestHooksSystemTargetId = GrainId.GetSystemTargetGrainId(26);
+        public static readonly GrainId ProtocolGatewayId = GrainId.GetSystemTargetGrainId(27);
 
         public const int PULLING_AGENTS_MANAGER_SYSTEM_TARGET_TYPE_CODE = 254;
         public const int PULLING_AGENT_SYSTEM_TARGET_TYPE_CODE = 255;
@@ -50,7 +52,9 @@ namespace Orleans.Runtime
         public static readonly GrainId SiloDirectConnectionId = GrainId.GetSystemGrainId(new Guid("01111111-1111-1111-1111-111111111111"));
 
         internal const long ReminderTableGrainId = 12345;
-         
+
+        public static readonly TimeSpan DEFAULT_OPENCONNECTION_TIMEOUT = TimeSpan.FromSeconds(5);
+
         /// <summary>
         /// The default timeout before a request is assumed to have failed.
         /// </summary>
@@ -82,8 +86,8 @@ namespace Orleans.Runtime
             {CatalogId,"Catalog"},
             {MembershipOracleId,"MembershipOracle"},
             {MultiClusterOracleId,"MultiClusterOracle"},
-            {ReminderServiceId,"ReminderService"},
             {TypeManagerId,"TypeManagerId"},
+            {ProtocolGatewayId,"ProtocolGateway"},
             {ProviderManagerSystemTargetId, "ProviderManagerSystemTarget"},
             {DeploymentLoadPublisherSystemTargetId, "DeploymentLoadPublisherSystemTarget"},
         };
@@ -94,11 +98,13 @@ namespace Orleans.Runtime
             {PULLING_AGENTS_MANAGER_SYSTEM_TARGET_TYPE_CODE, "PullingAgentsManagerSystemTarget"},
         };
 
+        public static ushort DefaultInterfaceVersion = 1;
+
         public static string SystemTargetName(GrainId id)
         {
             string name;
             if (singletonSystemTargetNames.TryGetValue(id, out name)) return name;
-            if (nonSingletonSystemTargetNames.TryGetValue(id.GetTypeCode(), out name)) return name;
+            if (nonSingletonSystemTargetNames.TryGetValue(id.TypeCode, out name)) return name;
             return String.Empty;
         }
 

@@ -321,7 +321,7 @@ namespace Orleans
         Runtime_Error_100312 = Runtime + 312,
         ClientInitializing   = Runtime + 313,
         ClientStarting       = Runtime + 314,
-        Runtime_Error_100315 = Runtime + 315,
+        ClientError          = Runtime + 315,
         Runtime_Error_100316 = Runtime + 316,
         Runtime_Error_100317 = Runtime + 317,
         Runtime_Error_100318 = Runtime + 318,
@@ -386,6 +386,8 @@ namespace Orleans
         SiloLoadedDI                    = SiloBase + 45, // Not used anymore
         SiloFailedToLoadDI              = SiloBase + 46, // Not used anymore
         SiloFileNotFoundLoadingDI       = SiloBase + 47, // Not used anymore
+        SiloStartupEventFailure           = SiloBase + 48,
+        SiloShutdownEventFailure        = SiloBase + 49,
 
         CatalogBase                     = Runtime + 500,
         CatalogNonExistingActivation1   = CatalogBase + 1,
@@ -825,8 +827,9 @@ namespace Orleans
         Dispatcher_InvalidActivation            = DispatcherBase + 38,
         InvokeWorkItem_UnhandledExceptionInInvoke = DispatcherBase + 39,
         Dispatcher_ErrorCreatingActivation      = DispatcherBase + 40,
+        Dispatcher_StuckActivation = DispatcherBase + 41,
 
-        SerializationBase                       = Runtime + 1600,
+        SerializationBase = Runtime + 1600,
         Ser_IncompatibleIntermediateType        = Runtime_Error_100033, // Backward compatability
         Ser_CannotConstructBaseObj              = Runtime_Error_100034, // Backward compatability
         Ser_IncompatibleType                    = Runtime_Error_100035, // Backward compatability
@@ -888,6 +891,7 @@ namespace Orleans
         SerMgr_TypeRegistrationFailureIgnore    = SerializationManagerBase + 9,
         SerMgr_ArtifactReport                   = SerializationManagerBase + 10,
         SerMgr_UnavailableSerializer            = SerializationManagerBase + 11,
+        SerMgr_SerializationMethodsMissing      = SerializationManagerBase + 12,
 
         WatchdogBase                            = Runtime + 2600,
         Watchdog_ParticipantThrownException     = WatchdogBase + 1,
@@ -973,6 +977,8 @@ namespace Orleans
         Provider_ProviderLoadedOk               = ProviderManagerBase + 14,
         Provider_ProviderNotFound               = ProviderManagerBase + 15,
         Provider_ProviderNotControllable        = ProviderManagerBase + 16,
+        Provider_CatalogNoLogConsistencyProvider       = ProviderManagerBase + 17,
+        Provider_CatalogLogConsistencyProviderAllocated = ProviderManagerBase + 18,
 
         AzureQueueBase = Runtime + 3200,
         AzureQueue_01 = AzureQueueBase + 1,
@@ -1093,6 +1099,18 @@ namespace Orleans
         GlobalSingleInstance_MaintainerException = GlobalSingleInstanceBase + 3,
         GlobalSingleInstance_MultipleOwners = GlobalSingleInstanceBase + 4,
 
+        TypeManagerBase = Runtime + 4200,
+        TypeManager_GetSiloGrainInterfaceMapError = TypeManagerBase + 1,
+
+        LogConsistencyBase = Runtime + 4300,
+        LogConsistency_UserCodeException = LogConsistencyBase + 1,
+        LogConsistency_CaughtException = LogConsistencyBase + 2,
+        LogConsistency_ProtocolError = LogConsistencyBase + 3,
+        LogConsistency_ProtocolFatalError = LogConsistencyBase + 4,
+        
+        // Note: individual Service Fabric error codes are defined in
+        // Microsoft.Orleans.ServiceFabric.Utilities.ErrorCode.
+        ServiceFabricBase = Runtime + 4400,
     }
 }
 // ReSharper restore InconsistentNaming

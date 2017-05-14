@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
 using Orleans.Runtime;
 using Orleans.Streams;
 
@@ -15,17 +16,21 @@ namespace Orleans.Providers
         private readonly Dictionary<Type, Tuple<IGrainExtension, IAddressable>> caoTable;
         private readonly AsyncLock lockable;
         private InvokeInterceptor invokeInterceptor;
+        private readonly IInternalGrainFactory grainFactory;
+        private readonly IRuntimeClient runtimeClient;
 
-        public ClientProviderRuntime(IGrainFactory grainFactory, IServiceProvider serviceProvider) 
+        public ClientProviderRuntime(IInternalGrainFactory grainFactory, IServiceProvider serviceProvider) 
         {
+            this.grainFactory = grainFactory;
+            this.ServiceProvider = serviceProvider;
+            this.runtimeClient = serviceProvider.GetService<IRuntimeClient>();
             caoTable = new Dictionary<Type, Tuple<IGrainExtension, IAddressable>>();
             lockable = new AsyncLock();
-            GrainFactory = grainFactory;
-            ServiceProvider = serviceProvider;
         }
 
-        public IGrainFactory GrainFactory { get; private set; }
-        public IServiceProvider ServiceProvider { get; private set; }
+        public IGrainFactory GrainFactory => this.grainFactory;
+        public IServiceProvider ServiceProvider { get; }
+
         public void SetInvokeInterceptor(InvokeInterceptor interceptor)
         {
             this.invokeInterceptor = interceptor;
@@ -40,10 +45,10 @@ namespace Orleans.Providers
         {
             if (null == implicitStreamSubscriberTable)
             {
-                throw new ArgumentNullException("implicitStreamSubscriberTable");
+                throw new ArgumentNullException(nameof(implicitStreamSubscriberTable));
             }
             grainBasedPubSub = new GrainBasedPubSubRuntime(GrainFactory);
-            var tmp = new ImplicitStreamPubSub(implicitStreamSubscriberTable);
+            var tmp = new ImplicitStreamPubSub(this.grainFactory, implicitStreamSubscriberTable);
             implictPubSub = tmp;
             combinedGrainBasedAndImplicitPubSub = new StreamPubSubImpl(grainBasedPubSub, tmp);
             streamDirectory = new StreamDirectory();
@@ -95,7 +100,7 @@ namespace Orleans.Providers
 
         public string ExecutingEntityIdentity()
         {
-            return RuntimeClient.Current.Identity;
+            return this.runtimeClient.CurrentActivationIdentity;
         }
 
         public SiloAddress ExecutingSiloAddress
@@ -108,7 +113,7 @@ namespace Orleans.Providers
             throw new NotImplementedException();
         }
 
-        public void UnRegisterSystemTarget(ISystemTarget target)
+        public void UnregisterSystemTarget(ISystemTarget target)
         {
             throw new NotImplementedException();
         }
@@ -139,7 +144,7 @@ namespace Orleans.Providers
                     var obj = ((GrainFactory)this.GrainFactory).CreateObjectReference<TExtensionInterface>(extension);
 
                     addressable = obj;
-
+                     
                     if (null == addressable)
                     {
                         throw new NullReferenceException("addressable");
@@ -173,13 +178,6 @@ namespace Orleans.Providers
         public IConsistentRingProviderForGrains GetConsistentRingProvider(int mySubRangeIndex, int numSubRanges)
         {
             throw new NotImplementedException("GetConsistentRingProvider");
-        }
-
-        public bool InSilo { get { return false; } }
-
-        public object GetCurrentSchedulingContext()
-        {
-            return null;
         }
     }
 }

@@ -5,25 +5,28 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 using Orleans.CodeGeneration;
+using Orleans.GrainDirectory;
+using Orleans.LogConsistency;
 using Orleans.Providers;
 using Orleans.Runtime.Configuration;
-
 
 namespace Orleans.Runtime
 {
     internal class SiloAssemblyLoader
     {
+        private readonly List<string> excludedGrains;
         private readonly LoggerImpl logger = LogManager.GetLogger("AssemblyLoader.Silo");
         private List<string> discoveredAssemblyLocations;
-        private Dictionary<string, SearchOption> directories;
+        private readonly Dictionary<string, SearchOption> directories;
+        private readonly MultiClusterRegistrationStrategyManager registrationManager;
 
-        public SiloAssemblyLoader(NodeConfiguration nodeConfig)
-            : this(nodeConfig.AdditionalAssemblyDirectories)
+        public SiloAssemblyLoader(NodeConfiguration nodeConfig, MultiClusterRegistrationStrategyManager registrationManager)
         {
-        }
-
-        public SiloAssemblyLoader(IDictionary<string, SearchOption> additionalDirectories)
-        {
+            IDictionary<string, SearchOption> additionalDirectories = nodeConfig.AdditionalAssemblyDirectories;
+            this.registrationManager = registrationManager;
+            this.excludedGrains = nodeConfig.ExcludedGrainTypes != null
+                ? new List<string>(nodeConfig.ExcludedGrainTypes)
+                : new List<string>();
             var exeRoot = Path.GetDirectoryName(typeof(SiloAssemblyLoader).GetTypeInfo().Assembly.Location);
             var appRoot = Path.Combine(exeRoot, "Applications");
             var cwd = Directory.GetCurrentDirectory();
@@ -80,6 +83,9 @@ namespace Orleans.Runtime
             foreach (var grainType in grainTypes)
             {
                 var className = TypeUtils.GetFullName(grainType);
+                if (excludedGrains.Contains(className))
+                    continue;
+
                 if (result.ContainsKey(className))
                     throw new InvalidOperationException(
                         string.Format("Precondition violated: GetLoadedGrainTypes should not return a duplicate type ({0})", className));
@@ -95,7 +101,7 @@ namespace Orleans.Runtime
                     if (parentTypeInfo.IsGenericType)
                     {
                         var definition = parentTypeInfo.GetGenericTypeDefinition();
-                        if (definition == typeof(Grain<>))
+                        if (definition == typeof(Grain<>) || definition == typeof(LogConsistentGrainBase<>))
                         {
                             var stateArg = parentType.GetGenericArguments()[0];
                             if (stateArg.GetTypeInfo().IsClass || stateArg.GetTypeInfo().IsValueType)
@@ -109,7 +115,7 @@ namespace Orleans.Runtime
                     parentType = parentTypeInfo.BaseType;
                 }
 
-                GrainTypeData typeData = GetTypeData(grainType, grainStateType);
+                GrainTypeData typeData = this.GetTypeData(grainType, grainStateType);
                 result.Add(className, typeData);
             }
 
@@ -140,11 +146,11 @@ namespace Orleans.Runtime
         /// <summary>
         /// Get type data for the given grain type
         /// </summary>
-        private static GrainTypeData GetTypeData(Type grainType, Type stateObjectType)
+        private GrainTypeData GetTypeData(Type grainType, Type stateObjectType)
         {
             return grainType.GetTypeInfo().IsGenericTypeDefinition ?
-                new GenericGrainTypeData(grainType, stateObjectType) :
-                new GrainTypeData(grainType, stateObjectType);
+                new GenericGrainTypeData(grainType, stateObjectType, this.registrationManager) :
+                new GrainTypeData(grainType, stateObjectType, this.registrationManager);
         }
 
         private static void LogGrainTypesFound(LoggerImpl logger, Dictionary<string, GrainTypeData> grainTypeData)

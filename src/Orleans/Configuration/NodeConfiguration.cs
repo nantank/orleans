@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -88,7 +89,7 @@ namespace Orleans.Runtime.Configuration
         /// <summary>
         /// The MaxActiveThreads attribute specifies the maximum number of simultaneous active threads the scheduler will allow.
         /// Generally this number should be roughly equal to the number of cores on the node.
-        /// Using a value of 0 will look at System.Environment.ProcessorCount to decide the number instead.
+        /// Using a value of 0 will look at System.Environment.ProcessorCount to decide the number instead, which is only valid when set from xml config
         /// </summary>
         public int MaxActiveThreads { get; set; }
 
@@ -212,6 +213,8 @@ namespace Orleans.Runtime.Configuration
 
         public Dictionary<string, SearchOption> AdditionalAssemblyDirectories { get; set; }
 
+        public List<string> ExcludedGrainTypes { get; set; }
+
         public string SiloShutdownEventName { get; set; }
 
         internal const string DEFAULT_NODE_NAME = "default";
@@ -248,7 +251,7 @@ namespace Orleans.Runtime.Configuration
 
             DefaultTraceLevel = Severity.Info;
             TraceLevelOverrides = new List<Tuple<string, Severity>>();
-            TraceToConsole = true;
+            TraceToConsole = ConsoleText.IsConsoleAvailable;
             TraceFilePattern = "{0}-{1}.log";
             LargeMessageWarningThreshold = Constants.LARGE_OBJECT_HEAP_THRESHOLD;
             PropagateActivityId = Constants.DEFAULT_PROPAGATE_E2E_ACTIVITY_ID;
@@ -270,6 +273,7 @@ namespace Orleans.Runtime.Configuration
             UseNagleAlgorithm = false;
 
             AdditionalAssemblyDirectories = new Dictionary<string, SearchOption>();
+            ExcludedGrainTypes = new List<string>();
         }
 
         public NodeConfiguration(NodeConfiguration other)
@@ -319,7 +323,8 @@ namespace Orleans.Runtime.Configuration
             UseNagleAlgorithm = other.UseNagleAlgorithm;
 
             StartupTypeName = other.StartupTypeName;
-            AdditionalAssemblyDirectories = other.AdditionalAssemblyDirectories;
+            AdditionalAssemblyDirectories = new Dictionary<string, SearchOption>(other.AdditionalAssemblyDirectories);
+            ExcludedGrainTypes = other.ExcludedGrainTypes.ToList();
         }
 
         public override string ToString()
@@ -487,7 +492,6 @@ namespace Orleans.Runtime.Configuration
                     case "AdditionalAssemblyDirectories":
                         ConfigUtilities.ParseAdditionalAssemblyDirectories(AdditionalAssemblyDirectories, child);
                         break;
-
                 }
             }
         }
